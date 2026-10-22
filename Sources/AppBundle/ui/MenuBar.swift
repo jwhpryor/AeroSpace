@@ -35,7 +35,10 @@ public func menuBar(viewModel: TrayMenuModel) -> some Scene { // todo should it 
                         }
                     } label: {
                         Toggle(isOn: .constant(workspace.isFocused)) {
-                            Text(workspace.name + workspace.suffix).font(.system(.body, design: .monospaced))
+                            workspaceMenuText(
+                                workspace.name + workspace.suffix,
+                                color: workspace.customColorRaw.flatMap(parseWorkspaceColor),
+                            )
                         }
                     }
                 }
@@ -140,4 +143,40 @@ func getTextEditorToOpenConfig() -> URL {
     NSWorkspace.shared.urlForApplication(toOpen: findCustomConfigUrl().urlOrNil ?? defaultConfigUrl)?
         .takeIf { $0.lastPathComponent != "Xcode.app" } // Blacklist Xcode. It is too heavy to open plain text files
         ?? URL(filePath: "/System/Applications/TextEdit.app")
+}
+
+private struct WorkspaceMenuCacheKey: Hashable {
+    let text: String
+    let color: Color
+}
+
+@MainActor private var workspaceMenuImageCache: [WorkspaceMenuCacheKey: CGImage] = [:]
+
+@MainActor @ViewBuilder
+func workspaceMenuText(_ text: String, color: Color?) -> some View {
+    let styledText = Text(text).font(.system(size: 14, design: .monospaced))
+    if let color, #available(macOS 14, *) {
+        let key = WorkspaceMenuCacheKey(text: text, color: color)
+        let cgImage: CGImage? = if let cached = workspaceMenuImageCache[key] {
+            cached
+        } else {
+            {
+                let renderer = ImageRenderer(content: styledText.foregroundStyle(color))
+                renderer.scale = 2
+                return renderer.cgImage.map {
+                    workspaceMenuImageCache[key] = $0
+                    return $0
+                }
+            }()
+        }
+        switch cgImage {
+            case let cgImage?:
+                Image(cgImage, scale: 2, label: Text(text))
+                    .renderingMode(.original)
+            case nil:
+                styledText
+        }
+    } else {
+        styledText
+    }
 }
