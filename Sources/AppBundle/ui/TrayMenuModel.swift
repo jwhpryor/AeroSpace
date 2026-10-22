@@ -15,6 +15,88 @@ public final class TrayMenuModel: ObservableObject {
     @Published var sponsorshipMessage: String = sponsorshipPrompts.randomElement().orDie()
     @Published var lastReloadConfigContainedWarnings: Bool = false
     @Published var axPermissionStatus: AxPermissionStatus = .waitingWithPrompt
+    @MainActor fileprivate var lastFileColors: [String: String] = [:]
+    @MainActor private var workspaceColorsDirWatchers: [String: WorkspaceColorsFsWatcher] = [:]
+    @MainActor private var workspaceColorsFileWatchers: [String: WorkspaceColorsFsWatcher] = [:]
+
+    @MainActor
+    func syncWorkspaceColorsWatchers() {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let defaultColorsDir = home.appending(path: ".aerospace_config/workspace_colors")
+        try? fm.createDirectory(at: defaultColorsDir, withIntermediateDirectories: true)
+
+        let dirs = experimentalUISettings.workspaceColorsDirectories
+        var activeDirPaths: Set<String> = []
+        var activeFilePaths: Set<String> = []
+
+        for dirUrl in dirs {
+            guard (try? dirUrl.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            activeDirPaths.insert(dirUrl.path)
+            if workspaceColorsDirWatchers[dirUrl.path] == nil {
+                workspaceColorsDirWatchers[dirUrl.path] = WorkspaceColorsFsWatcher(path: dirUrl.path) {
+                    TrayMenuModel.shared.onWorkspaceColorsFsEvent()
+                }
+            }
+            if let entries = try? fm.contentsOfDirectory(at: dirUrl, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+                for fileUrl in entries where (try? fileUrl.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                    activeFilePaths.insert(fileUrl.path)
+                    if workspaceColorsFileWatchers[fileUrl.path] == nil {
+                        workspaceColorsFileWatchers[fileUrl.path] = WorkspaceColorsFsWatcher(path: fileUrl.path) {
+                            TrayMenuModel.shared.onWorkspaceColorsFsEvent()
+                        }
+                    }
+                }
+            }
+        }
+
+        for path in Array(workspaceColorsDirWatchers.keys) where !activeDirPaths.contains(path) || workspaceColorsDirWatchers[path]?.isValid != true {
+            workspaceColorsDirWatchers.removeValue(forKey: path)
+        }
+        for path in Array(workspaceColorsFileWatchers.keys) where !activeFilePaths.contains(path) || workspaceColorsFileWatchers[path]?.isValid != true {
+            workspaceColorsFileWatchers.removeValue(forKey: path)
+        }
+    }
+
+    @MainActor
+    private func onWorkspaceColorsFsEvent() {
+        syncWorkspaceColorsWatchers()
+        let currentFileColors = experimentalUISettings.loadFileWorkspaceColors()
+        if currentFileColors != lastFileColors {
+            updateTrayText()
+        }
+    }
+}
+
+private final class WorkspaceColorsFsWatcher {
+    private let source: DispatchSourceFileSystemObject
+    private let fd: Int32
+    private(set) var isValid: Bool = true
+
+    init?(path: String, onChange: @escaping @MainActor () -> Void) {
+        fd = unsafe open(path, O_EVTONLY)
+        if fd < 0 { return nil }
+        source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .attrib, .link, .rename, .delete, .revoke],
+            queue: .main,
+        )
+        source.setEventHandler { [weak self] in
+            if let self {
+                let flags = self.source.data
+                if flags.contains(.delete) || flags.contains(.rename) || flags.contains(.revoke) {
+                    self.isValid = false
+                }
+            }
+            MainActor.checkIsolated { onChange() }
+        }
+        source.setCancelHandler { [fd] in close(fd) }
+        source.activate()
+    }
+
+    deinit {
+        source.cancel()
+    }
 }
 
 enum AxPermissionStatus: Equatable {
@@ -24,9 +106,12 @@ enum AxPermissionStatus: Equatable {
 }
 
 @MainActor func updateTrayText() {
+    if !isUnitTest {
+        TrayMenuModel.shared.syncWorkspaceColorsWatchers()
+    }
     let sortedMonitors = sortedMonitorInfos
     let focus = focus
-    TrayMenuModel.shared.trayText = (activeMode?.takeIf { $0 != mainModeId }?.first.map { "(\($0.uppercased())) " } ?? "") +
+    let newTrayText = (activeMode?.takeIf { $0 != mainModeId }?.first.map { "(\($0.uppercased())) " } ?? "") +
         sortedMonitors
         .map {
             let hasFullscreenWindows = $0.activeWorkspace.allLeafWindowsRecursive.contains { $0.isFullscreen }
@@ -34,7 +119,12 @@ enum AxPermissionStatus: Equatable {
             return ($0.activeWorkspace == focus.workspace && sortedMonitors.count > 1 ? "*" : "") + activeWorkspaceName
         }
         .joined(separator: " │ ")
-    TrayMenuModel.shared.workspaces = Workspace.all.map {
+    if TrayMenuModel.shared.trayText != newTrayText {
+        TrayMenuModel.shared.trayText = newTrayText
+    }
+    let fileColors = isUnitTest ? [:] : TrayMenuModel.shared.experimentalUISettings.loadFileWorkspaceColors()
+    TrayMenuModel.shared.lastFileColors = fileColors
+    let newWorkspaces = Workspace.all.map {
         let apps = $0.allLeafWindowsRecursive.map { $0.app.name?.takeIf { !$0.isEmpty } }.filterNotNil().toSet()
         let dash = " - "
         let suffix = switch true {
@@ -43,6 +133,9 @@ enum AxPermissionStatus: Equatable {
             default: ""
         }
         let hasFullscreenWindows = $0.allLeafWindowsRecursive.contains { $0.isFullscreen }
+        let customColorRaw = isUnitTest
+            ? nil
+            : TrayMenuModel.shared.experimentalUISettings.workspaceColorRaw(for: $0.name, fileColors: fileColors)
         return WorkspaceViewModel(
             name: $0.name,
             suffix: suffix,
@@ -50,7 +143,11 @@ enum AxPermissionStatus: Equatable {
             isEffectivelyEmpty: $0.isEffectivelyEmpty,
             isVisible: $0.isVisible,
             hasFullscreenWindows: hasFullscreenWindows,
+            customColorRaw: customColorRaw,
         )
+    }
+    if TrayMenuModel.shared.workspaces != newWorkspaces {
+        TrayMenuModel.shared.workspaces = newWorkspaces
     }
     var items = sortedMonitors.map {
         let hasFullscreenWindows = $0.activeWorkspace.allLeafWindowsRecursive.contains { $0.isFullscreen }
@@ -67,7 +164,9 @@ enum AxPermissionStatus: Equatable {
     if let mode {
         items.insert(mode, at: 0)
     }
-    TrayMenuModel.shared.trayItems = items
+    if TrayMenuModel.shared.trayItems != items {
+        TrayMenuModel.shared.trayItems = items
+    }
 }
 
 struct WorkspaceViewModel: Hashable {
@@ -77,6 +176,7 @@ struct WorkspaceViewModel: Hashable {
     let isEffectivelyEmpty: Bool
     let isVisible: Bool
     let hasFullscreenWindows: Bool
+    let customColorRaw: String?
 }
 
 enum TrayItemType: String, Hashable {
