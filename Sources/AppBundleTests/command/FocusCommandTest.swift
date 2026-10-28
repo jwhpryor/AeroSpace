@@ -345,4 +345,49 @@ final class FocusCommandTest: XCTestCase {
         assertEquals(await parseCommand("focus --boundaries-action wrap-around-the-workspace dfs-next").cmdOrDie.run(.defaultEnv, .emptyStdin).exitCode.rawValue, 0)
         assertEquals(globalFocus.windowOrNil?.windowId, 1)
     }
+
+    func testConcurrentFocusWithFloatingWindowsDoesNotCrash() async throws {
+        let ws = Workspace.get(byName: name)
+        let w1 = TestWindow.new(
+            id: 1,
+            parent: ws.floatingWindowsContainer,
+            rect: Rect(topLeftX: 0, topLeftY: 0, width: 100, height: 100),
+        )
+        let w2 = TestWindow.new(
+            id: 2,
+            parent: ws.floatingWindowsContainer,
+            rect: Rect(topLeftX: 200, topLeftY: 0, width: 100, height: 100),
+        )
+        w1.onGetAxRect = { await Task.yield() }
+        w2.onGetAxRect = { await Task.yield() }
+        _ = w1.focusWindow()
+
+        // 1. Concurrent direct FocusCommand executions interleaving across getCenter await points
+        async let r1 = parseCommand("focus right").cmdOrDie.run(.defaultEnv, .emptyStdin)
+        async let r2 = parseCommand("focus left").cmdOrDie.run(.defaultEnv, .emptyStdin)
+        _ = await (r1, r2)
+        assertEquals(ws.floatingWindows.count, 2)
+
+        // 2. Concurrent runLightSession executions (rapid hotkeys / socket commands)
+        var executionOrder: [String] = []
+        let t1 = Task.startUnstructured { @MainActor in
+            try await runLightSession(.focusFollowsMouse, .forceRun) {
+                executionOrder.append("t1-start")
+                _ = await parseCommand("focus right").cmdOrDie.run(.defaultEnv, .emptyStdin)
+                executionOrder.append("t1-end")
+            }
+        }
+        let t2 = Task.startUnstructured { @MainActor in
+            try await runLightSession(.focusFollowsMouse, .forceRun) {
+                executionOrder.append("t2-start")
+                _ = await parseCommand("focus --window-id 1").cmdOrDie.run(.defaultEnv, .emptyStdin)
+                executionOrder.append("t2-end")
+            }
+        }
+        try await t1.value
+        try await t2.value
+        assertEquals(executionOrder, ["t1-start", "t1-end", "t2-start", "t2-end"])
+        assertEquals(ws.floatingWindows.count, 2)
+        assertEquals(globalFocus.windowOrNil?.windowId, 1)
+    }
 }

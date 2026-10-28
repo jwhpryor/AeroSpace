@@ -300,6 +300,24 @@ final class MacWindow: Window {
     }
 
     @MainActor
+    func restoreDetachedWindowPosition(from sourceWindow: MacWindow?) {
+        let fallback = sourceWindow?.prevUnhiddenProportionalPositionInsideWorkspaceRect
+            ?? sourceWindow?.lastRestoredProportionalPositionInsideWorkspaceRect
+            ?? sourceWindow.flatMap { MacWindow.loadSavedCornerPosition($0) }
+            ?? prevUnhiddenProportionalPositionInsideWorkspaceRect
+            ?? lastRestoredProportionalPositionInsideWorkspaceRect
+            ?? MacWindow.loadSavedCornerPosition(self)
+            ?? MacWindow.allWindows.first(where: { $0.app.pid == app.pid && $0.windowId != windowId })
+            .flatMap { $0.lastRestoredProportionalPositionInsideWorkspaceRect ?? $0.prevUnhiddenProportionalPositionInsideWorkspaceRect ?? MacWindow.loadSavedCornerPosition($0) }
+            ?? CGPoint(x: 0.0, y: 0.03)
+        prevUnhiddenProportionalPositionInsideWorkspaceRect = fallback
+        if let sourceSize = sourceWindow?.lastFloatingSize {
+            lastFloatingSize = sourceSize
+        }
+        unhideFromCorner()
+    }
+
+    @MainActor
     func unhideFromCorner() {
         self.hiddenInCorner = nil
         if prevUnhiddenProportionalPositionInsideWorkspaceRect == nil,

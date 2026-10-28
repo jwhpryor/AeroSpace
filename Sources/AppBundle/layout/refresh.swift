@@ -6,6 +6,29 @@ private var activeRefreshTask: Task<(), any Error>? = nil
 
 @MainActor
 private var isRunningLightSession = false
+@MainActor
+private var lightSessionWaiters: [CheckedContinuation<Void, Never>] = []
+
+@MainActor
+private func acquireLightSessionLock() async {
+    if !isRunningLightSession {
+        isRunningLightSession = true
+        return
+    }
+    await withCheckedContinuation { cont in
+        lightSessionWaiters.append(cont)
+    }
+}
+
+@MainActor
+private func releaseLightSessionLock() {
+    if !lightSessionWaiters.isEmpty {
+        let next = lightSessionWaiters.removeFirst()
+        next.resume()
+    } else {
+        isRunningLightSession = false
+    }
+}
 
 @MainActor
 func cancelActiveRefreshTask() {
@@ -78,10 +101,15 @@ func runLightSession<T>(
             try await body()
         }
     }
+    await acquireLightSessionLock()
     activeRefreshTask?.cancel() // Give priority to runSession
     activeRefreshTask = nil
-    isRunningLightSession = true
-    defer { isRunningLightSession = false }
+    var didReleaseLock = false
+    defer {
+        if !didReleaseLock {
+            releaseLightSessionLock()
+        }
+    }
     return try await $refreshSessionEvent.withValue(event) {
         if isUnitTest || !event.isWorkspaceSwitch {
             let nativeFocused = try await getNativeFocusedWindow(.cancellable)
@@ -105,7 +133,8 @@ func runLightSession<T>(
         }
         updateTrayText()
         SecureInputPanel.shared.refresh()
-        isRunningLightSession = false
+        didReleaseLock = true
+        releaseLightSessionLock()
         if !event.isFocusFollowsMouse && (isUnitTest || !event.isWorkspaceSwitch) {
             scheduleCancellableCompleteRefreshSession(event)
         }
@@ -173,11 +202,12 @@ func refreshObs(_: AXObserver, _: AXUIElement, notif: CFString, _: UnsafeMutable
                 app.needsWindowRefresh = true
             }
             if notif == kAXWindowCreatedNotification {
+                app.onNewWindowCreated()
                 app.markExternallyUnhiddenOrActivated()
                 app.unhideIfHiddenByAeroSpace(forceIfHidden: true)
             }
         }
-        if notif == kAXFocusedWindowChangedNotification {
+        if notif == kAXFocusedWindowChangedNotification || notif == kAXMainWindowChangedNotification {
             if let pid, let app = MacApp.allAppsMap[pid], app.isSuppressingSelfFocusNotifications {
                 return
             }
@@ -186,6 +216,13 @@ func refreshObs(_: AXObserver, _: AXUIElement, notif: CFString, _: UnsafeMutable
                focusedMacWindow.macApp.isSuppressingSelfFocusNotifications
             {
                 return
+            }
+            if let pid, let app = MacApp.allAppsMap[pid], app.rawAppBundleId == "com.google.Chrome" {
+                if globalFocus.windowOrNil?.app.rawAppBundleId != "com.google.Chrome" ||
+                   NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.google.Chrome"
+                {
+                    await app.checkForNewlyOpenedExternalChromeTab()
+                }
             }
         }
         scheduleCancellableCompleteRefreshSession(.ax(notif))

@@ -15,9 +15,13 @@ struct FocusCommand: Command {
             return .fail
         }
         // todo bug: floating windows break mru
-        let floatingWindows = args.floatingAsTiling ? await makeFloatingWindowsSeenAsTiling(workspace: target.workspace) : []
+        let shouldMakeFloatingSeenAsTiling = switch args.target {
+            case .windowId: false
+            case .direction, .dfsIndex, .dfsRelative: args.floatingAsTiling
+        }
+        let floatingWindows = shouldMakeFloatingSeenAsTiling ? await makeFloatingWindowsSeenAsTiling(workspace: target.workspace) : []
         defer {
-            if args.floatingAsTiling {
+            if shouldMakeFloatingSeenAsTiling {
                 restoreFloatingWindows(floatingWindows: floatingWindows, workspace: target.workspace)
             }
         }
@@ -127,10 +131,11 @@ struct FocusCommand: Command {
     defer {
         mruBefore?.markAsMostRecentChild()
     }
-    var _floatingWindows: [FloatingWindowData] = []
+    var candidates: [(window: Window, center: CGPoint, tilingParent: TilingContainer, index: Int)] = []
     for window in workspace.floatingWindows {
         // todo bug: we shouldn't access ax api here. What if the window was moved but it wasn't committed to ax yet?
         guard let center = try? await window.getCenter(.nonCancellable) else { continue }
+        guard window.parent == workspace.floatingWindowsContainer else { continue }
 
         let tilingParent: TilingContainer
         let index: Int
@@ -138,13 +143,14 @@ struct FocusCommand: Command {
             .findWindowRecursively(in: workspace.rootTilingContainer, virtual: true, fullscreenCoversAll: false)
         {
             guard let targetCenter = try? await target.getCenter(.nonCancellable) else { continue }
-            guard let _tilingParent = target.parent as? TilingContainer else { continue }
+            guard window.parent == workspace.floatingWindowsContainer else { continue }
+            guard let _tilingParent = target.parent as? TilingContainer, let targetIndex = target.ownIndex(in: .all) else { continue }
             tilingParent = _tilingParent
             index = switch tilingParent.layout {
                 case .tiles:
                     center.getProjection(tilingParent.orientation) >= targetCenter.getProjection(tilingParent.orientation)
-                        ? target.ownIndex(in: .all).orDie() + 1
-                        : target.ownIndex(in: .all).orDie()
+                        ? targetIndex + 1
+                        : targetIndex
                 case .accordion:
                     center.getProjection(tilingParent.orientation) >= targetCenter.getProjection(tilingParent.orientation)
                         ? tilingParent.children.count
@@ -155,20 +161,29 @@ struct FocusCommand: Command {
             tilingParent = workspace.rootTilingContainer
         }
 
-        let data = window.unbindFromParent()
-        let floatingWindowData = FloatingWindowData(
+        candidates.append((
             window: window,
             center: center,
             tilingParent: tilingParent,
-            adaptiveWeight: data.adaptiveWeight,
             index: index,
-        )
-        _floatingWindows.append(floatingWindowData)
+        ))
     }
-    let floatingWindows: [FloatingWindowData] = _floatingWindows.sortedBy { $0.center.getProjection($0.tilingParent.orientation) }.reversed()
+    let sortedCandidates = candidates.sortedBy { $0.center.getProjection($0.tilingParent.orientation) }.reversed()
 
-    for floating in floatingWindows { // Make floating windows be seen as tiling
-        floating.window.bind(to: floating.tilingParent, adaptiveWeight: 1, index: floating.index)
+    var floatingWindows: [FloatingWindowData] = []
+    for candidate in sortedCandidates { // Make floating windows be seen as tiling
+        guard candidate.window.parent == workspace.floatingWindowsContainer,
+              candidate.tilingParent.nodeWorkspace == workspace
+        else { continue }
+        let safeIndex = min(max(0, candidate.index), candidate.tilingParent.children.count)
+        guard let data = candidate.window.bind(to: candidate.tilingParent, adaptiveWeight: 1, index: safeIndex) else { continue }
+        floatingWindows.append(FloatingWindowData(
+            window: candidate.window,
+            center: candidate.center,
+            tilingParent: candidate.tilingParent,
+            adaptiveWeight: data.adaptiveWeight,
+            index: safeIndex,
+        ))
     }
     return floatingWindows
 }
@@ -179,6 +194,7 @@ struct FocusCommand: Command {
         mruBefore?.markAsMostRecentChild()
     }
     for floating in floatingWindows {
+        guard floating.window.isBound else { continue }
         floating.window.bind(to: workspace.floatingWindowsContainer, adaptiveWeight: floating.adaptiveWeight, index: INDEX_BIND_LAST)
     }
 }
