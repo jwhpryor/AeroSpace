@@ -1,3 +1,6 @@
+
+
+
 import AppKit
 import Common
 
@@ -20,6 +23,7 @@ import Common
     if !isUnitTest, let winWorkspace = nativeFocused?.nodeWorkspace, !winWorkspace.isVisible {
         if case .globalObserver(let notif) = refreshSessionEvent,
            notif == NSWorkspace.didActivateApplicationNotification.rawValue,
+           nativeFocused?.app.rawAppBundleId != "com.google.Chrome",
            let appPid = nativeFocused?.app.pid,
            let visibleWin = globalFocus.workspace.allLeafWindowsRecursiveMru.first(where: { $0.app.pid == appPid })
         {

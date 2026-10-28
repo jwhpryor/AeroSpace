@@ -20,7 +20,14 @@ enum GlobalObserver {
                     }
                     app.markExternallyUnhiddenOrActivated()
                     if app.rawAppBundleId == "com.google.Chrome" {
+                        MacApp.lastExternalChromeActivationTime = .now
                         await app.checkForNewlyOpenedExternalChromeTab()
+                        Task.startUnstructured { @MainActor in
+                            for delayMs in [100, 250] {
+                                try? await Task.sleep(for: .milliseconds(delayMs))
+                                await app.checkForNewlyOpenedExternalChromeTab()
+                            }
+                        }
                     }
                 } else if notifName == NSWorkspace.didActivateApplicationNotification.rawValue {
                     onAppActivatedInWorkspace(notifPid)
@@ -37,7 +44,14 @@ enum GlobalObserver {
                     }
                     app.markExternallyUnhiddenOrActivated()
                     if app.rawAppBundleId == "com.google.Chrome" {
+                        MacApp.lastExternalChromeActivationTime = .now
                         await app.checkForNewlyOpenedExternalChromeTab()
+                        Task.startUnstructured { @MainActor in
+                            for delayMs in [100, 250] {
+                                try? await Task.sleep(for: .milliseconds(delayMs))
+                                await app.checkForNewlyOpenedExternalChromeTab()
+                            }
+                        }
                     }
                 }
             }
@@ -93,6 +107,11 @@ enum GlobalObserver {
             //  resetManipulatedWithMouseIfPossible might call its own refreshSession
             //  The end of the callback calls refreshSession
             Task.startUnstructured { @MainActor in
+                let wasNonChrome = globalFocus.windowOrNil?.app.rawAppBundleId != "com.google.Chrome" ||
+                    NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.google.Chrome"
+                if wasNonChrome {
+                    MacApp.lastNonChromeLeftMouseUpTime = .now
+                }
                 try await resetManipulatedWithMouseIfPossible()
                 let mouseLocation = mouseLocation
                 let clickedMonitor = mouseLocation.monitorApproximation
@@ -106,14 +125,6 @@ enum GlobalObserver {
                     //  And trigger new window detection that could be delayed due to mouseDown event
                     default:
                         scheduleCancellableCompleteRefreshSession(.globalObserverLeftMouseUp)
-                        if globalFocus.windowOrNil?.app.rawAppBundleId != "com.google.Chrome" {
-                            for delayMs in [120, 320] {
-                                try? await Task.sleep(for: .milliseconds(delayMs))
-                                for app in MacApp.allAppsMap.values where app.rawAppBundleId == "com.google.Chrome" {
-                                    await app.checkForNewlyOpenedExternalChromeTab()
-                                }
-                            }
-                        }
                 }
             }
         }
