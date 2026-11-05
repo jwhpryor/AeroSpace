@@ -105,4 +105,17 @@ final class TreeNodeTest: XCTestCase {
         workspace.normalizeContainers()
         XCTAssertTrue(workspace.rootTilingContainer.children.singleOrNil() is TestWindow)
     }
+
+    func testGarbageCollectUnusedWorkspacesUnbindsFromContainer() {
+        let wsOld = Workspace.get(byName: "transient-ws")
+        XCTAssertTrue(wsOld.parent is WorkspacesContainer)
+
+        Workspace.garbageCollectUnusedWorkspaces()
+        XCTAssertNil(wsOld.parent)
+
+        let wsNew = Workspace.get(byName: "transient-ws")
+        XCTAssertTrue(wsOld !== wsNew)
+        XCTAssertTrue(wsNew.focusWorkspace())
+        XCTAssertEqual(mainMonitorInfo.visibleWorkspace, globalFocus.workspace)
+    }
 }

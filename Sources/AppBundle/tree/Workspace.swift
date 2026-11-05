@@ -65,10 +65,14 @@ final class Workspace: TreeNode, NonLeafTreeNodeObject, Hashable, Comparable {
         }
         let focus = globalFocus
         workspaceNameToWorkspace = workspaceNameToWorkspace.filter { (_, workspace: Workspace) in
-            config.persistentWorkspaces.contains(workspace.name) ||
+            let keep = config.persistentWorkspaces.contains(workspace.name) ||
                 !workspace.isEffectivelyEmpty ||
                 workspace.isVisible ||
                 workspace.name == focus.workspace.name
+            if !keep {
+                workspace.unbindFromParent()
+            }
+            return keep
         }
     }
 

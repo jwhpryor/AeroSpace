@@ -55,6 +55,11 @@ enum GlobalObserver {
                     }
                 }
             }
+            if !MacWindow.savedWindowWorkspaces.isEmpty {
+                for app in MacApp.allAppsMap.values {
+                    app.needsWindowRefresh = true
+                }
+            }
             if notifName == NSWorkspace.didActivateApplicationNotification.rawValue {
                 scheduleCancellableCompleteRefreshSession(.globalObserver(notifName), optimisticallyPreLayoutWorkspaces: true)
             } else {
@@ -100,6 +105,36 @@ enum GlobalObserver {
         nc.addObserver(forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: .main, using: onNotif)
         nc.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main, using: onNotif)
         nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main, using: onNotif)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task.startUnstructured { @MainActor in
+                if !TrayMenuModel.shared.isEnabled { return }
+                gcMonitors()
+                for app in MacApp.allAppsMap.values {
+                    app.needsWindowRefresh = true
+                }
+                for window in MacWindow.allWindows where window.isHiddenInCorner {
+                    window.needsCornerRehide = true
+                }
+                scheduleCancellableCompleteRefreshSession(.globalObserver("didChangeScreenParameters"))
+            }
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.screenIsUnlocked"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task.startUnstructured { @MainActor in
+                if !TrayMenuModel.shared.isEnabled { return }
+                for app in MacApp.allAppsMap.values {
+                    app.needsWindowRefresh = true
+                }
+                scheduleCancellableCompleteRefreshSession(.globalObserver("com.apple.screenIsUnlocked"))
+            }
+        }
 
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { _ in
             guard let token: RunSessionGuard = .isServerEnabled else { return }

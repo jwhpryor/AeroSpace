@@ -18,12 +18,19 @@ import Foundation
         _ = await reloadConfig_nonCancellable()
 
         startUnixSocketServer()
+        QuotaStatusBar.shared.start()
         GlobalObserver.initObserver()
         Workspace.garbageCollectUnusedWorkspaces() // init workspaces
         for monitor in Monitor.all {
             _ = monitor.getWorkspacesContainerOrCreate().children.filterIsInstance(of: Workspace.self)
                 .min()?
                 .focusWorkspace()
+        }
+        if let savedFocusedWs = (try? String(contentsOf: URL(filePath: "/tmp/aerospace_focused_workspace.txt"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !savedFocusedWs.isEmpty
+        {
+            _ = Workspace.get(byName: savedFocusedWs).focusWorkspace()
         }
         for nsApp in NSWorkspace.shared.runningApplications where nsApp.activationPolicy == .regular && nsApp.isHidden {
             nsApp.unhide()

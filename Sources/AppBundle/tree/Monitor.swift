@@ -84,6 +84,10 @@ final class Monitor: TreeNode, NonLeafTreeNodeObject {
         pointToMonitor[monitor.info.rect.topLeftCorner] = monitor
         i += 1
     }
+
+    for window in MacWindow.allWindows where window.isHiddenInCorner {
+        window.needsCornerRehide = true
+    }
 }
 
 extension MonitorInfo {
@@ -94,6 +98,16 @@ extension MonitorInfo {
 
     @MainActor func toMonitorOrRearrangeMonitors() -> Monitor {
         if let existing = pointToMonitor[rect.topLeftCorner] {
+            let old = existing._info
+            if old.rect.topLeftCorner != self.rect.topLeftCorner || old.rect.size != self.rect.size ||
+                old.visibleRect.topLeftCorner != self.visibleRect.topLeftCorner || old.visibleRect.size != self.visibleRect.size ||
+                old.name != self.name
+            {
+                existing._info = self
+                for window in MacWindow.allWindows where window.isHiddenInCorner {
+                    window.needsCornerRehide = true
+                }
+            }
             return existing
         }
         rearrangeMonitors() // If monitor configuration changed
@@ -113,7 +127,15 @@ extension MonitorInfo {
 }
 
 @MainActor func gcMonitors() {
-    if pointToMonitor.count != globalUnsortedMonitorInfos.count {
+    let infos = globalUnsortedMonitorInfos
+    let needsRearrange = pointToMonitor.count != infos.count || infos.contains { info in
+        guard let existing = pointToMonitor[info.rect.topLeftCorner] else { return true }
+        let old = existing.info
+        return old.rect.topLeftCorner != info.rect.topLeftCorner || old.rect.size != info.rect.size ||
+            old.visibleRect.topLeftCorner != info.visibleRect.topLeftCorner || old.visibleRect.size != info.visibleRect.size ||
+            old.name != info.name
+    }
+    if needsRearrange {
         rearrangeMonitors()
     }
 }

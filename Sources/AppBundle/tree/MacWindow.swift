@@ -25,6 +25,14 @@ final class MacWindow: Window {
     }
 
     @MainActor
+    func isPointInAnyKnownHideCorner(_ topLeftCorner: CGPoint) -> Bool {
+        if isPointInHideCorner(topLeftCorner) { return true }
+        // Also recognize windows still parked at a previous monitor's bottom-right corner
+        if topLeftCorner.x >= 1725 && topLeftCorner.y >= 1050 { return true }
+        return false
+    }
+
+    @MainActor
     func isCurrentlyInHideCorner() -> Bool {
         guard !isUnitTest else { return false }
         if let rect = getCgWindowRect(for: self) {
@@ -101,17 +109,42 @@ final class MacWindow: Window {
         return CGPoint(x: arr[0], y: arr[1])
     }
 
+    private static let savedWindowsBackupUrl = URL(filePath: "/tmp/aerospace_windows_backup.txt")
+    @MainActor static var savedWindowWorkspaces: [String: String] = {
+        guard let text = try? String(contentsOf: savedWindowsBackupUrl, encoding: .utf8) else { return [:] }
+        var map: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "|", maxSplits: 1)
+            if parts.count == 2 {
+                let wid = String(parts[0]).trimmingCharacters(in: .whitespaces)
+                let ws = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                if !wid.isEmpty && !ws.isEmpty {
+                    map[wid] = ws
+                }
+            }
+        }
+        return map
+    }()
+
     @MainActor
     @discardableResult
     static func getOrRegister(windowId: OpaqueWindowId, macApp: MacApp) async throws -> MacWindow {
         if let existing = allWindowsMap[windowId] { return existing }
         let rect = try await macApp.getAxRect(windowId, .cancellable)
+        let savedWsKey = macApp.nativeWindowId(of: windowId).map(String.init) ?? windowId.description
+        let savedWorkspaceName = isUnitTest ? nil : savedWindowWorkspaces.removeValue(forKey: savedWsKey)
+        let targetWorkspace: Workspace
+        if let savedWorkspaceName, !savedWorkspaceName.isEmpty {
+            targetWorkspace = Workspace.get(byName: savedWorkspaceName)
+        } else if isStartup {
+            targetWorkspace = (rect?.center.monitorApproximation ?? mainMonitorInfo).visibleWorkspace
+        } else {
+            targetWorkspace = globalFocus.workspace
+        }
         let data = try await unbindAndGetBindingDataForNewWindow(
             windowId,
             macApp,
-            isStartup
-                ? (rect?.center.monitorApproximation ?? mainMonitorInfo).visibleWorkspace
-                : globalFocus.workspace,
+            targetWorkspace,
             window: nil,
             .cancellable,
         )
@@ -126,11 +159,17 @@ final class MacWindow: Window {
             await runOnWindowDetected(ifConventional: window)
             if !isUnitTest,
                !isStartup,
+               savedWorkspaceName == nil,
                window.nodeWorkspace?.isVisible == true
             {
                 window.unhideFromCorner()
                 _ = window.focusWindow()
                 window.nativeFocus()
+            } else if !isUnitTest,
+                      savedWorkspaceName != nil,
+                      window.nodeWorkspace?.isVisible == true
+            {
+                window.unhideFromCorner()
             }
         }
         return window
@@ -244,7 +283,7 @@ final class MacWindow: Window {
                 let monitorRect = windowRect.center.monitorApproximation.rect // Similar to layoutFloatingWindow. Non idempotent
                 let absolutePoint = topLeftCorner - monitorRect.topLeftCorner
                 let proportional = CGPoint(x: absolutePoint.x / monitorRect.width, y: absolutePoint.y / monitorRect.height)
-                let isStillClampedInCorner = !isUnitTest && isPointInHideCorner(topLeftCorner)
+                let isStillClampedInCorner = !isUnitTest && isPointInAnyKnownHideCorner(topLeftCorner)
                 if isStillClampedInCorner, let fallback = lastRestoredProportionalPositionInsideWorkspaceRect ?? MacWindow.loadSavedCornerPosition(self) {
                     prevUnhiddenProportionalPositionInsideWorkspaceRect = fallback
                     lastRestoredProportionalPositionInsideWorkspaceRect = fallback
@@ -260,14 +299,11 @@ final class MacWindow: Window {
                 }
             }
         } else if hiddenInCorner == corner {
-            if !isUnitTest && ((macApp.isHiddenByAeroSpace && macApp.nsApp.isHidden) || isCurrentlyInHideCorner()) && refreshSessionEvent?.isStartup != true {
-                needsCornerRehide = false
+            if !isUnitTest && !needsCornerRehide && ((macApp.isHiddenByAeroSpace && macApp.nsApp.isHidden) || isCurrentlyInHideCorner()) && refreshSessionEvent?.isStartup != true {
                 return
             }
             lastCommandedTopLeft = nil
-            needsCornerRehide = false
         }
-        needsCornerRehide = false
         let p: CGPoint
         switch corner {
             case .bottomLeftCorner:
@@ -295,6 +331,9 @@ final class MacWindow: Window {
         }
         hiddenInCorner = corner
         if isUnitTest || !macApp.nsApp.isHidden {
+            needsCornerRehide = false
+            setAxFrame(p, nil)
+        } else if needsCornerRehide {
             setAxFrame(p, nil)
         }
     }
@@ -322,7 +361,8 @@ final class MacWindow: Window {
         self.hiddenInCorner = nil
         if prevUnhiddenProportionalPositionInsideWorkspaceRect == nil,
            !isUnitTest,
-           isCurrentlyInHideCorner()
+           let rect = getCgWindowRect(for: self),
+           isPointInAnyKnownHideCorner(rect.topLeftCorner)
         {
             let fallback = lastRestoredProportionalPositionInsideWorkspaceRect
                 ?? MacWindow.loadSavedCornerPosition(self)
