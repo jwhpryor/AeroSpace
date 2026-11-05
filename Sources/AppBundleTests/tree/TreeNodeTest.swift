@@ -125,4 +125,17 @@ struct TreeNodeTest {
         workspace.normalizeContainers()
         #expect(workspace.rootTilingContainer.children.singleOrNil() is TestWindow)
     }
+
+    @Test func testGarbageCollectUnusedWorkspacesUnbindsFromContainer() {
+        let wsOld = Workspace.get(byName: "transient-ws")
+        #expect(wsOld.parent is WorkspacesContainer)
+
+        Workspace.garbageCollectUnusedWorkspaces()
+        #expect(wsOld.parent == nil)
+
+        let wsNew = Workspace.get(byName: "transient-ws")
+        #expect(wsOld !== wsNew)
+        #expect(wsNew.focusWorkspace())
+        assertEquals(mainMonitorInfo.visibleWorkspace, globalFocus.workspace)
+    }
 }
