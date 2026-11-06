@@ -142,11 +142,7 @@ enum GlobalObserver {
             //  resetManipulatedWithMouseIfPossible might call its own refreshSession
             //  The end of the callback calls refreshSession
             Task.startUnstructured { @MainActor in
-                let wasNonChrome = globalFocus.windowOrNil?.app.rawAppBundleId != "com.google.Chrome" ||
-                    NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.google.Chrome"
-                if wasNonChrome {
-                    MacApp.lastNonChromeLeftMouseUpTime = .now
-                }
+                MacApp.lastNonChromeLeftMouseUpTime = .now
                 try await resetManipulatedWithMouseIfPossible()
                 let mouseLocation = mouseLocation
                 let clickedMonitor = mouseLocation.monitorApproximation
