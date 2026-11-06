@@ -192,9 +192,12 @@ private func refresh() async throws {
     Workspace.garbageCollectUnusedWorkspaces()
 }
 
-func refreshObs(_: AXObserver, _: AXUIElement, notif: CFString, _: UnsafeMutableRawPointer?) {
+func refreshObs(_: AXObserver, ax: AXUIElement, notif: CFString, _: UnsafeMutableRawPointer?) {
     let notif = notif as String
     let pid = axTaskLocalAppThreadToken?.pid
+    let isFocusOrMainNotif = notif == kAXFocusedWindowChangedNotification || notif == kAXMainWindowChangedNotification
+    let notifWinId: UInt32? = isFocusOrMainNotif ? ax.containingNativeWindowId() : nil
+    let notifWinTitle: String? = (isFocusOrMainNotif && notifWinId != nil) ? ax.get(Ax.titleAttr) : nil
     Task.startUnstructured { @MainActor in
         if !TrayMenuModel.shared.isEnabled { return }
         if let pid, let app = MacApp.allAppsMap[pid] {
@@ -207,7 +210,7 @@ func refreshObs(_: AXObserver, _: AXUIElement, notif: CFString, _: UnsafeMutable
                 app.unhideIfHiddenByAeroSpace(forceIfHidden: true)
             }
         }
-        if notif == kAXFocusedWindowChangedNotification || notif == kAXMainWindowChangedNotification {
+        if isFocusOrMainNotif {
             if let pid, let app = MacApp.allAppsMap[pid], app.isSuppressingSelfFocusNotifications {
                 return
             }
@@ -218,11 +221,7 @@ func refreshObs(_: AXObserver, _: AXUIElement, notif: CFString, _: UnsafeMutable
                 return
             }
             if let pid, let app = MacApp.allAppsMap[pid], app.rawAppBundleId == "com.google.Chrome" {
-                if globalFocus.windowOrNil?.app.rawAppBundleId != "com.google.Chrome" ||
-                   NSWorkspace.shared.frontmostApplication?.bundleIdentifier != "com.google.Chrome"
-                {
-                    await app.checkForNewlyOpenedExternalChromeTab()
-                }
+                await app.onChromeWindowFocusedOrMainChanged(notifWinId, notifWinTitle)
             }
         }
         scheduleCancellableCompleteRefreshSession(.ax(notif))
