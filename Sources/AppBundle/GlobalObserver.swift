@@ -35,13 +35,6 @@ enum GlobalObserver {
                         cancelActiveRefreshTask()
                         return
                     }
-                    if let hideTime = MacApp.lastAeroSpaceActiveAppHideTime,
-                       hideTime.duration(to: .now) < .milliseconds(400),
-                       app.isEligibleForAeroSpaceAutoHide()
-                    {
-                        app.scheduleHideByAeroSpaceIfEligible()
-                        return
-                    }
                     app.markExternallyUnhiddenOrActivated()
                     if app.rawAppBundleId == "com.google.Chrome" {
                         MacApp.lastExternalChromeActivationTime = .now

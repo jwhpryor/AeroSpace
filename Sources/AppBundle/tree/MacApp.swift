@@ -40,6 +40,7 @@ final class MacApp: AbstractApp {
     @MainActor private var lastTitleChangedChromeWindowId: UInt32? = nil
     @MainActor private var lastFocusedOffWorkspaceChromeWindowId: UInt32? = nil
     @MainActor private var lastNewWindowCreatedTime: ContinuousClock.Instant? = nil
+    @MainActor private var lastWindowDestroyedTime: ContinuousClock.Instant? = nil
     @MainActor private var isCheckingChromeTabMenu: Bool = false
     @MainActor private var pendingChromeTabMenuCheck: Bool = false
     @MainActor private var pendingChromeHintWindowId: UInt32? = nil
@@ -217,11 +218,26 @@ final class MacApp: AbstractApp {
     }
 
     @MainActor
+    func onWindowDestroyed() {
+        lastWindowDestroyedTime = .now
+        if rawAppBundleId == "com.google.Chrome" {
+            lastOffWorkspaceTitleChangeTime.removeAll()
+            lastOffWorkspaceFocusTime.removeAll()
+            preChangeTitles.removeAll()
+            lastTitleChangedChromeWindowId = nil
+            lastFocusedOffWorkspaceChromeWindowId = nil
+        }
+        enforceOffWorkspaceWindowsParkedInCorner()
+    }
+
+    @MainActor
     func onChromeWindowFocusedOrMainChanged(_ nativeWindowId: UInt32?, _ currentTitle: String?) async {
+        let hasRecentDestroyedWin = lastWindowDestroyedTime.map { $0.duration(to: .now) < .seconds(1.5) } ?? false
         guard rawAppBundleId == "com.google.Chrome",
               !isUnitTest,
               !serverArgs.isReadOnly,
-              !isDetachingTabToNewWindow
+              !isDetachingTabToNewWindow,
+              !hasRecentDestroyedWin
         else { return }
         if let nativeWindowId {
             let opaqueId = opaqueWindowId(of: nativeWindowId)
@@ -320,7 +336,8 @@ final class MacApp: AbstractApp {
     @MainActor
     private func performChromeTabMenuCheckOnce(hintWindowId: UInt32?, thread: Thread) async {
         let hasRecentNewWin = lastNewWindowCreatedTime.map { $0.duration(to: .now) < .seconds(2.5) } ?? false
-        if hasRecentNewWin || isSuppressingSelfFocusNotifications {
+        let hasRecentDestroyedWin = lastWindowDestroyedTime.map { $0.duration(to: .now) < .seconds(1.5) } ?? false
+        if hasRecentNewWin || hasRecentDestroyedWin || isSuppressingSelfFocusNotifications {
             return
         }
 
@@ -572,20 +589,34 @@ final class MacApp: AbstractApp {
         isHiddenByAeroSpace = false
         if !isUnitTest && !serverArgs.isReadOnly && nsApp.isHidden {
             suppressNextUnhideNotification = true
+            for workspace in Workspace.all where !workspace.isVisible {
+                for window in workspace.allLeafWindowsRecursive where window.app.pid == self.pid {
+                    (window as? MacWindow)?.needsCornerRehide = true
+                }
+            }
             nsApp.unhide()
             _ = thread?.runInLoopAsync(job: RunLoopJob(.cancellable), autoCheckCancelled: false) { [axApp] _ in
                 _ = AXUIElementSetAttributeValue(axApp.threadGuarded, kAXHiddenAttribute as CFString, kCFBooleanFalse)
             }
-            Task.startUnstructured { @MainActor [weak self] in
-                for delayMs in [60, 180] {
+            enforceOffWorkspaceWindowsParkedInCorner()
+        }
+    }
+
+    @MainActor
+    func enforceOffWorkspaceWindowsParkedInCorner() {
+        guard !isUnitTest && !serverArgs.isReadOnly else { return }
+        Task.startUnstructured { @MainActor [weak self] in
+            for delayMs in [0, 40, 140] {
+                if delayMs > 0 {
                     try? await Task.sleep(for: .milliseconds(delayMs))
-                    guard let self, !self.nsApp.isHidden else { return }
-                    for workspace in Workspace.all where !workspace.isVisible {
-                        for window in workspace.allLeafWindowsRecursive where window.app.pid == self.pid {
-                            let macWin = window as! MacWindow
-                            if !macWin.isCurrentlyInHideCorner() {
-                                try? await macWin.hideInCorner(.bottomRightCorner)
-                            }
+                }
+                guard let self, !self.nsApp.isHidden else { return }
+                for workspace in Workspace.all where !workspace.isVisible {
+                    for window in workspace.allLeafWindowsRecursive where window.app.pid == self.pid {
+                        let macWin = window as! MacWindow
+                        if macWin.needsCornerRehide || !macWin.isCurrentlyInHideCorner() {
+                            macWin.needsCornerRehide = true
+                            try? await macWin.hideInCorner(.bottomRightCorner)
                         }
                     }
                 }
@@ -614,6 +645,7 @@ final class MacApp: AbstractApp {
     @MainActor
     func markExternallyUnhiddenOrActivated() {
         needsWindowRefresh = true
+        enforceOffWorkspaceWindowsParkedInCorner()
         guard isHiddenByAeroSpace else { return }
         hideTaskGeneration &+= 1
         isAutoHideTaskPending = false
@@ -622,44 +654,13 @@ final class MacApp: AbstractApp {
     }
 
     @MainActor
-    func scheduleHideByAeroSpaceIfEligible() {
-        if isUnitTest || serverArgs.isReadOnly || !TrayMenuModel.shared.isEnabled { return }
-        if let until = preventAutoHideUntil, ContinuousClock.now < until { return }
-        if isHiddenByAeroSpace && nsApp.isHidden { return }
-        if nsApp.isHidden { return } // Already hidden by the user (Cmd+H)
-        if isAutoHideTaskPending { return }
-
-        hideTaskGeneration &+= 1
-        isAutoHideTaskPending = true
-        let generation = hideTaskGeneration
-        Task.startUnstructured { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                if self.hideTaskGeneration == generation {
-                    self.isAutoHideTaskPending = false
-                }
-            }
-            // Wait for any pending corner setAxFrame jobs queued on this app's AX thread
-            // so all windows are parked in the hide corner before hiding the app.
-            _ = try? await self.thread?.runInLoop(.cancellable) { _ in () }
-            if self.nsApp.isActive {
-                try? await Task.sleep(for: .milliseconds(120))
-            }
-            guard self.hideTaskGeneration == generation,
-                  TrayMenuModel.shared.isEnabled,
-                  !serverArgs.isReadOnly,
-                  !self.nsApp.isTerminated,
-                  !self.nsApp.isHidden
-            else { return }
-            if let until = self.preventAutoHideUntil, ContinuousClock.now < until { return }
-            guard self.isEligibleForAeroSpaceAutoHide() else { return }
-            if self.nsApp.isActive {
-                MacApp.lastAeroSpaceActiveAppHideTime = .now
-            }
-            self.isHiddenByAeroSpace = true
-            self.suppressNextHideNotification = true
-            self.nsApp.hide()
-        }
+    func scheduleHideByAeroSpaceIfEligible(delayMs: Int? = nil) {
+        // Never use NSRunningApplication.hide() to auto-hide off-workspace apps:
+        // macOS WindowServer caches hidden window frames and ignores/defers AX position
+        // updates while an app is hidden, causing stale off-workspace windows to flash
+        // across the screen whenever the app is unhidden or spawns a new window.
+        // Instead, off-workspace windows remain parked in the 1px hide corner behind
+        // HideCornerOccluder.
     }
 
     @MainActor

@@ -23,6 +23,36 @@ struct Main {
             exit(EXIT_CODE_ZERO, out: usage)
         }
 
+        if args.first == "move" {
+            let moveSubArgs = Array(args.dropFirst())
+            let isTilingMove: Bool = {
+                guard let first = moveSubArgs.first else { return false }
+                let tilingTokens: Set<String> = [
+                    "left", "down", "up", "right",
+                    "--help", "-h",
+                    "--window-id", "--boundaries", "--boundaries-action",
+                    "--fail-if-fullscreen", "--fail-if-macos-native-fullscreen",
+                ]
+                return tilingTokens.contains(first)
+            }()
+            if !isTilingMove {
+                let helperPath = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("env/add_to_path/aero-ws-move").path
+                if FileManager.default.isExecutableFile(atPath: helperPath) {
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: helperPath)
+                    proc.arguments = moveSubArgs
+                    proc.standardInput = FileHandle.standardInput
+                    proc.standardOutput = FileHandle.standardOutput
+                    proc.standardError = FileHandle.standardError
+                    if let _ = try? proc.run() {
+                        proc.waitUntilExit()
+                        exit(proc.terminationStatus)
+                    }
+                }
+            }
+        }
+
         if args.first == "--version" || args.first == "-v" {
             let connection = NWConnection(to: NWEndpoint.unix(path: socketPath), using: .tcp)
             let serverVersionAndHash: String?

@@ -162,7 +162,7 @@ final class MacWindow: Window {
                savedWorkspaceName == nil,
                window.nodeWorkspace?.isVisible == true
             {
-                window.unhideFromCorner()
+                window.unhideFromCorner(centerIfSpawnedInCorner: true)
                 _ = window.focusWindow()
                 window.nativeFocus()
             } else if !isUnitTest,
@@ -218,6 +218,7 @@ final class MacWindow: Window {
         if MacWindow.allWindowsMap.removeValue(forKey: windowId) == nil {
             return
         }
+        macApp.onWindowDestroyed()
         if !skipClosedWindowsCache { cacheClosedWindowIfNeeded() }
         let parent = unbindFromParent().parent
         let deadWindowWorkspace = parent.nodeWorkspace
@@ -236,6 +237,9 @@ final class MacWindow: Window {
                     } else if let sameAppWindow = deadWindowWorkspace.allLeafWindowsRecursiveMru.first(where: { $0.app.pid == app.pid }) {
                         _ = sameAppWindow.focusWindow()
                         sameAppWindow.nativeFocus()
+                    } else if let nextWindow = deadWindowWorkspace.allLeafWindowsRecursiveMru.first {
+                        _ = nextWindow.focusWindow()
+                        nextWindow.nativeFocus()
                     } else if focus.windowOrNil == nil || focus.windowOrNil?.app.pid == app.pid {
                         stickyClosedAppPidOnCurrentWorkspace = app.pid
                         _ = setFocus(to: LiveFocus(windowOrNil: nil, workspace: deadWindowWorkspace))
@@ -299,7 +303,7 @@ final class MacWindow: Window {
                 }
             }
         } else if hiddenInCorner == corner {
-            if !isUnitTest && !needsCornerRehide && ((macApp.isHiddenByAeroSpace && macApp.nsApp.isHidden) || isCurrentlyInHideCorner()) && refreshSessionEvent?.isStartup != true {
+            if !isUnitTest && !needsCornerRehide && isCurrentlyInHideCorner() && refreshSessionEvent?.isStartup != true {
                 return
             }
             lastCommandedTopLeft = nil
@@ -329,13 +333,12 @@ final class MacWindow: Window {
                 let onePixelOffset = macApp.appId == .zoom ? .zero : CGPoint(x: 1, y: 1)
                 p = nodeMonitorInfo.visibleRect.bottomRightCorner - onePixelOffset
         }
-        hiddenInCorner = corner
-        if isUnitTest || !macApp.nsApp.isHidden {
-            needsCornerRehide = false
-            setAxFrame(p, nil)
-        } else if needsCornerRehide {
-            setAxFrame(p, nil)
+        if needsCornerRehide || refreshSessionEvent?.isStartup == true {
+            lastCommandedTopLeft = nil
         }
+        hiddenInCorner = corner
+        needsCornerRehide = false
+        setAxFrame(p, nil)
     }
 
     @MainActor
@@ -357,21 +360,58 @@ final class MacWindow: Window {
     }
 
     @MainActor
-    func unhideFromCorner() {
+    func unhideFromCorner(centerIfSpawnedInCorner: Bool = false) {
         self.hiddenInCorner = nil
         if prevUnhiddenProportionalPositionInsideWorkspaceRect == nil,
            !isUnitTest,
            let rect = getCgWindowRect(for: self),
            isPointInAnyKnownHideCorner(rect.topLeftCorner)
         {
-            let fallback = lastRestoredProportionalPositionInsideWorkspaceRect
-                ?? MacWindow.loadSavedCornerPosition(self)
-                ?? MacWindow.allWindows.first(where: { $0.app.pid == app.pid && $0.windowId != windowId })
-                .flatMap { $0.lastRestoredProportionalPositionInsideWorkspaceRect ?? $0.prevUnhiddenProportionalPositionInsideWorkspaceRect ?? MacWindow.loadSavedCornerPosition($0) }
-                ?? CGPoint(x: 0.1, y: 0.05)
+            let fallback: CGPoint
+            if centerIfSpawnedInCorner {
+                if let saved = lastRestoredProportionalPositionInsideWorkspaceRect ?? MacWindow.loadSavedCornerPosition(self) {
+                    fallback = saved
+                } else {
+                    let workspaceRect = nodeWorkspace?.workspaceMonitorInfo.visibleRect ?? mainMonitorInfo.visibleRect
+                    let monitorRect = nodeWorkspace?.workspaceMonitorInfo.rect ?? mainMonitorInfo.rect
+                    let windowWidth = lastFloatingSize?.width ?? rect.width
+                    let windowHeight = lastFloatingSize?.height ?? rect.height
+                    let cx = max(workspaceRect.minX, workspaceRect.minX + (workspaceRect.width - windowWidth) * 0.5)
+                    let cy = max(workspaceRect.minY, workspaceRect.minY + (workspaceRect.height - windowHeight) * 0.5)
+                    fallback = CGPoint(
+                        x: (cx - monitorRect.topLeftX) / monitorRect.width,
+                        y: (cy - monitorRect.topLeftY) / monitorRect.height,
+                    )
+                }
+            } else {
+                fallback = lastRestoredProportionalPositionInsideWorkspaceRect
+                    ?? MacWindow.loadSavedCornerPosition(self)
+                    ?? MacWindow.allWindows.first(where: { $0.app.pid == app.pid && $0.windowId != windowId })
+                    .flatMap { $0.lastRestoredProportionalPositionInsideWorkspaceRect ?? $0.prevUnhiddenProportionalPositionInsideWorkspaceRect ?? MacWindow.loadSavedCornerPosition($0) }
+                    ?? CGPoint(x: 0.1, y: 0.05)
+            }
             prevUnhiddenProportionalPositionInsideWorkspaceRect = fallback
         }
-        guard let prevUnhiddenProportionalPositionInsideWorkspaceRect else { return }
+        guard let prevUnhiddenProportionalPositionInsideWorkspaceRect else {
+            if centerIfSpawnedInCorner,
+               !isUnitTest,
+               let nodeWorkspace,
+               let parent,
+               case .floatingWindow = getChildParentRelation(child: self, parent: parent)
+            {
+                let workspaceRect = nodeWorkspace.workspaceMonitorInfo.visibleRect
+                let windowWidth = lastFloatingSize?.width ?? (workspaceRect.width * 0.7)
+                let windowHeight = lastFloatingSize?.height ?? (workspaceRect.height * 0.8)
+                if let rect = getCgWindowRect(for: self),
+                   rect.topLeftX > workspaceRect.maxX - 80 || rect.topLeftY > workspaceRect.maxY - 80
+                {
+                    let newX = max(workspaceRect.minX, workspaceRect.minX + (workspaceRect.width - windowWidth) * 0.5)
+                    let newY = max(workspaceRect.minY, workspaceRect.minY + (workspaceRect.height - windowHeight) * 0.5)
+                    setAxFrame(CGPoint(x: newX, y: newY), nil)
+                }
+            }
+            return
+        }
         guard let nodeWorkspace else { return } // hiding only makes sense for workspace windows
         guard let parent else { return }
 
@@ -444,11 +484,39 @@ extension Window {
 @MainActor
 private func unbindAndGetBindingDataForNewWindow(_ windowId: OpaqueWindowId, _ macApp: MacApp, _ workspace: Workspace, window: Window?, _ cm: CancellationMode) async throws -> BindingData {
     let windowLevel = try await macApp.getWindowLevel(windowId, cm)
-    return switch try await macApp.getAxUiElementWindowType(windowId, windowLevel, cm) {
-        case .popup: BindingData(parent: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
-        case .dialog: BindingData(parent: workspace.floatingWindowsContainer, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
-        case .window: unbindAndGetBindingDataForNewTilingWindow(workspace, window: window)
+    switch try await macApp.getAxUiElementWindowType(windowId, windowLevel, cm) {
+        case .popup:
+            return BindingData(parent: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
+        case .dialog:
+            return BindingData(parent: workspace.floatingWindowsContainer, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
+        case .window:
+            if hasUnconditionalFloatingOnWindowDetected() {
+                window?.unbindFromParent()
+                return BindingData(parent: workspace.floatingWindowsContainer, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
+            }
+            return unbindAndGetBindingDataForNewTilingWindow(workspace, window: window)
     }
+}
+
+@MainActor
+private func hasUnconditionalFloatingOnWindowDetected() -> Bool {
+    for callback in config.onWindowDetected {
+        switch callback.matcher {
+            case .command(let cmd):
+                if case .empty = cmd {} else { continue }
+            case .legacy(let m):
+                if m.appId != nil || m.appNameRegexSubstring != nil || m.windowTitleRegexSubstring != nil || m.workspace != nil || m.duringAeroSpaceStartup != nil {
+                    continue
+                }
+        }
+        if case .cmd(let c) = callback.rawRun,
+           let layoutCmd = c as? LayoutCommand,
+           layoutCmd.args.toggleBetween.val == [.floating]
+        {
+            return true
+        }
+    }
+    return false
 }
 
 // The function is private because it's unsafe. It leaves the window in unbound state
