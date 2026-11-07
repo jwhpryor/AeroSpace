@@ -31,8 +31,7 @@ enum GlobalObserver {
                     }
                 } else if notifName == NSWorkspace.didActivateApplicationNotification.rawValue {
                     onAppActivatedInWorkspace(notifPid)
-                    if (app.isSuppressingSelfFocusNotifications || !app.isHiddenByAeroSpace) && globalFocus.windowOrNil?.app.pid == app.pid {
-                        cancelActiveRefreshTask()
+                    if app.isSuppressingSelfFocusNotifications && !app.needsWindowRefresh && globalFocus.windowOrNil?.app.pid == app.pid {
                         return
                     }
                     app.markExternallyUnhiddenOrActivated()

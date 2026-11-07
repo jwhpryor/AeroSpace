@@ -102,6 +102,7 @@ func runLightSession<T>(
         }
     }
     await acquireLightSessionLock()
+    let hadActiveRefreshTask = activeRefreshTask != nil
     activeRefreshTask?.cancel() // Give priority to runSession
     activeRefreshTask = nil
     var didReleaseLock = false
@@ -138,7 +139,7 @@ func runLightSession<T>(
         SecureInputPanel.shared.refresh()
         didReleaseLock = true
         releaseLightSessionLock()
-        if !event.isFocusFollowsMouse && (isUnitTest || !event.isWorkspaceSwitch) {
+        if !event.isFocusFollowsMouse && (isUnitTest || !event.isWorkspaceSwitch || hadActiveRefreshTask || MacApp.allAppsMap.values.contains(where: \.needsWindowRefresh)) {
             scheduleCancellableCompleteRefreshSession(event)
         }
         return result
@@ -215,12 +216,21 @@ func refreshObs(_: AXObserver, ax: AXUIElement, notif: CFString, _: UnsafeMutabl
             }
         }
         if isFocusOrMainNotif {
-            if let pid, let app = MacApp.allAppsMap[pid], app.isSuppressingSelfFocusNotifications {
-                return
+            if let pid, let app = MacApp.allAppsMap[pid] {
+                if let notifWinId {
+                    let existingWin = app.opaqueWindowId(of: notifWinId).flatMap { MacWindow.allWindowsMap[$0] }
+                    if existingWin == nil || existingWin?.parent is MacosPopupWindowsContainer {
+                        app.needsWindowRefresh = true
+                    }
+                }
+                if app.isSuppressingSelfFocusNotifications && !app.needsWindowRefresh {
+                    return
+                }
             }
             if let focusedMacWindow = globalFocus.windowOrNil as? MacWindow,
                focusedMacWindow.macApp.pid == pid,
-               focusedMacWindow.macApp.isSuppressingSelfFocusNotifications
+               focusedMacWindow.macApp.isSuppressingSelfFocusNotifications,
+               !focusedMacWindow.macApp.needsWindowRefresh
             {
                 return
             }

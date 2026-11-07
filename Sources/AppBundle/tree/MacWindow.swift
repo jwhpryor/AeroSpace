@@ -218,9 +218,9 @@ final class MacWindow: Window {
         if MacWindow.allWindowsMap.removeValue(forKey: windowId) == nil {
             return
         }
-        macApp.onWindowDestroyed()
         if !skipClosedWindowsCache { cacheClosedWindowIfNeeded() }
         let parent = unbindFromParent().parent
+        macApp.onWindowDestroyed(isPopup: parent is MacosPopupWindowsContainer)
         let deadWindowWorkspace = parent.nodeWorkspace
         let focus = globalFocus
         if let deadWindowWorkspace, deadWindowWorkspace == focus.workspace ||
