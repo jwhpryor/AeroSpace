@@ -128,6 +128,9 @@ func runLightSession<T>(
 
         if !event.isFocusFollowsMouse {
             try await layoutWorkspaces(focusToSync: focusToSync)
+            if isExplicitFocusCommand {
+                await (focusToSync as? MacWindow)?.macApp.waitForPendingAxJobs()
+            }
         } else {
             focusToSync?.nativeFocus() // syncFocusToMacOs
         }
@@ -207,7 +210,8 @@ func refreshObs(_: AXObserver, ax: AXUIElement, notif: CFString, _: UnsafeMutabl
             if notif == kAXWindowCreatedNotification {
                 app.onNewWindowCreated()
                 app.markExternallyUnhiddenOrActivated()
-                app.unhideIfHiddenByAeroSpace(forceIfHidden: true)
+            } else if notif == kAXUIElementDestroyedNotification {
+                app.onWindowDestroyed()
             }
         }
         if isFocusOrMainNotif {
