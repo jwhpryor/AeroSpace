@@ -23,14 +23,24 @@ func getCgWindowRect(for window: MacWindow) -> Rect? {
 
 @MainActor func getWindowLevel(forNativeId windowId: UInt32, _ cm: CancellationMode) async throws -> MacOsWindowLevel? {
     if let existing = cache[windowId] { return existing }
+    if let cfArray = CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(windowId)) as? [CFDictionary],
+       let elem = cfArray.first,
+       let _windowLayer = (elem as NSDictionary)[kCGWindowLayer]
+    {
+        let windowLayer = ((_windowLayer as! CFNumber) as NSNumber).intValue
+        let level = MacOsWindowLevel.new(windowLevel: windowLayer)
+        cache[windowId] = level
+        return level
+    }
     if let wip {
         try await wip.await(cm)
         return cache[windowId]
     }
-    wip = AwaitableOneTimeBroadcastLatch()
+    let latch = AwaitableOneTimeBroadcastLatch()
+    wip = latch
     cache = await computeCache()
     wip = nil
-    await wip?.signalToAll()
+    await latch.signalToAll()
     return cache[windowId]
 }
 

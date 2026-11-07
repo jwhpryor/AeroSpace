@@ -20,6 +20,15 @@ import Common
     if nativeFocused?.parent is MacosPopupWindowsContainer {
         return
     }
+    if !isUnitTest,
+       let macApp = nativeFocused?.app as? MacApp,
+       macApp.isSuppressingSelfFocusNotifications,
+       let lastId = lastKnownNativeFocusedWindowId,
+       nativeFocused?.windowId != lastId,
+       MacWindow.allWindowsMap[lastId] != nil
+    {
+        return
+    }
     if !isUnitTest, let winWorkspace = nativeFocused?.nodeWorkspace, !winWorkspace.isVisible {
         if case .globalObserver(let notif) = refreshSessionEvent,
            notif == NSWorkspace.didActivateApplicationNotification.rawValue,

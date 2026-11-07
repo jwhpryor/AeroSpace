@@ -170,13 +170,22 @@ final class MacApp: AbstractApp {
 
     // todo merge together with detectNewWindows
     func getFocusedWindow(_ cm: CancellationMode) async throws -> Window? {
-        let nativeWindowId = try await thread?.runInLoop(cm) { [nsApp, axApp, windows] job in
-            try axApp.threadGuarded.get(Ax.focusedWindowAttr)
-                .flatMap { try windows.threadGuarded.getOrRegisterAxWindow(windowId: $0.windowId, $0.ax.cast, nsApp, job) }?
-                .windowId
-        }
+        let (nativeWindowId, isNewAxWindow) = try await thread?.runInLoop(cm) { [nsApp, axApp, windows] job -> (UInt32?, Bool) in
+            guard let focused = axApp.threadGuarded.get(Ax.focusedWindowAttr) else { return (nil, false) }
+            let existed = windows.threadGuarded[focused.windowId] != nil
+            guard let win = try windows.threadGuarded.getOrRegisterAxWindow(windowId: focused.windowId, focused.ax.cast, nsApp, job) else {
+                return (nil, false)
+            }
+            return (win.windowId, !existed)
+        } ?? (nil, false)
         guard let nativeWindowId else { return nil }
-        return try await MacWindow.getOrRegister(windowId: getOrRegisterOpaqueWindowId(nativeWindowId), macApp: self)
+        let opaqueId = getOrRegisterOpaqueWindowId(nativeWindowId)
+        if isNewAxWindow || cachedAliveWindowIds[opaqueId] != .alive || MacWindow.allWindowsMap[opaqueId] == nil {
+            cachedAliveWindowIds[opaqueId] = .alive
+            lifeStatusesOfLastRefresh[nativeWindowId] = .alive
+            needsWindowRefresh = true
+        }
+        return try await MacWindow.getOrRegister(windowId: opaqueId, macApp: self)
     }
 
     @MainActor func nativeFocus(_ windowId: OpaqueWindowId) {
@@ -218,14 +227,23 @@ final class MacApp: AbstractApp {
     }
 
     @MainActor
-    func onWindowDestroyed() {
-        lastWindowDestroyedTime = .now
-        if rawAppBundleId == "com.google.Chrome" {
-            lastOffWorkspaceTitleChangeTime.removeAll()
-            lastOffWorkspaceFocusTime.removeAll()
-            preChangeTitles.removeAll()
-            lastTitleChangedChromeWindowId = nil
-            lastFocusedOffWorkspaceChromeWindowId = nil
+    func onWindowDestroyed(isPopup: Bool = false) {
+        if !isPopup {
+            lastWindowDestroyedTime = .now
+            if rawAppBundleId == "com.google.Chrome" {
+                lastOffWorkspaceTitleChangeTime.removeAll()
+                lastOffWorkspaceFocusTime.removeAll()
+                preChangeTitles.removeAll()
+                lastTitleChangedChromeWindowId = nil
+                lastFocusedOffWorkspaceChromeWindowId = nil
+            }
+        } else if !isUnitTest,
+                  let lastNew = lastNewWindowCreatedTime,
+                  lastNew.duration(to: .now) < .seconds(2.0),
+                  let focusedWin = globalFocus.windowOrNil,
+                  focusedWin.app.pid == self.pid
+        {
+            focusedWin.nativeFocus()
         }
         enforceOffWorkspaceWindowsParkedInCorner()
     }
@@ -242,7 +260,12 @@ final class MacApp: AbstractApp {
         if let nativeWindowId {
             let opaqueId = opaqueWindowId(of: nativeWindowId)
             let win = opaqueId.flatMap { MacWindow.allWindowsMap[$0] }
-            let isOffWorkspace = win == nil || win?.nodeWorkspace == nil || win?.nodeWorkspace?.isVisible == false
+            guard let win, !(win.parent is MacosPopupWindowsContainer) else {
+                needsWindowRefresh = true
+                onNewWindowCreated()
+                return
+            }
+            let isOffWorkspace = win.nodeWorkspace == nil || win.nodeWorkspace?.isVisible == false
             if isOffWorkspace {
                 lastOffWorkspaceFocusTime[nativeWindowId] = .now
                 lastFocusedOffWorkspaceChromeWindowId = nativeWindowId
@@ -286,7 +309,7 @@ final class MacApp: AbstractApp {
 
         let opaqueId = opaqueWindowId(of: nativeWindowId)
         let win = opaqueId.flatMap { MacWindow.allWindowsMap[$0] }
-        let isOffWorkspace = win == nil || win?.nodeWorkspace == nil || win?.nodeWorkspace?.isVisible == false
+        let isOffWorkspace = win != nil && !(win?.parent is MacosPopupWindowsContainer) && (win?.nodeWorkspace == nil || win?.nodeWorkspace?.isVisible == false)
         guard isOffWorkspace else {
             preChangeTitles.removeValue(forKey: nativeWindowId)
             lastOffWorkspaceTitleChangeTime.removeValue(forKey: nativeWindowId)
@@ -368,7 +391,7 @@ final class MacApp: AbstractApp {
 
         let targetOpaqueId = opaqueWindowId(of: winId)
         let targetWin = targetOpaqueId.flatMap { MacWindow.allWindowsMap[$0] }
-        let isOffWorkspace = targetWin == nil || targetWin?.nodeWorkspace == nil || targetWin?.nodeWorkspace?.isVisible == false
+        let isOffWorkspace = targetWin != nil && !(targetWin?.parent is MacosPopupWindowsContainer) && (targetWin?.nodeWorkspace == nil || targetWin?.nodeWorkspace?.isVisible == false)
         guard isOffWorkspace else {
             preChangeTitles.removeValue(forKey: winId)
             lastOffWorkspaceTitleChangeTime.removeValue(forKey: winId)
@@ -898,7 +921,10 @@ final class MacApp: AbstractApp {
             await destroy()
             return [:]
         }
-        if !isUnitTest && hasCompletedInitialWindowRefresh && !needsWindowRefresh {
+        let hasUnregisteredCachedWindow = cachedAliveWindowIds.contains { id, status in
+            status == .alive && MacWindow.allWindowsMap[id] == nil
+        }
+        if !isUnitTest && hasCompletedInitialWindowRefresh && !needsWindowRefresh && !hasUnregisteredCachedWindow {
             switch refreshSessionEvent {
                 case .startup:
                     break
@@ -910,11 +936,12 @@ final class MacApp: AbstractApp {
         }
         guard let thread else { return [:] }
         let existingTitleIds = Set(cachedTitles.keys)
-        let (rawAliveOrInvisible, newTitles) = try await thread
-            .runInLoop(.cancellable) { [nsApp, windows, axApp, bgTabsScheduledForPrune] (job) -> ([UInt32: WindowLifeStatus], [UInt32: String]) in
+        let (rawAliveOrInvisible, newTitles, skippedDueToMouseDown) = try await thread
+            .runInLoop(.cancellable) { [nsApp, windows, axApp, bgTabsScheduledForPrune] (job) -> ([UInt32: WindowLifeStatus], [UInt32: String], Bool) in
                 var aliveOrInvisible: [UInt32: AxWindow] = windows.threadGuarded.filter { !bgTabsScheduledForPrune.contains($0.key) }
                 var aliveWindowIds: Set<UInt32> = []
                 var newTitles: [UInt32: String] = [:]
+                var skippedMouseDown = false
                 // Second line of defence against lock screen. See the first line of defence: closedWindowsCache
                 // Second and third lines of defence are technically needed only to avoid potential flickering
                 if frontmostAppBundleId != lockScreenAppBundleId {
@@ -926,25 +953,42 @@ final class MacApp: AbstractApp {
 
                 for (id, window) in axApp.threadGuarded.get(Ax.windowsAttr) ?? [] {
                     try job.checkCancellation()
+                    if aliveOrInvisible[id] == nil && isLeftMouseButtonDown {
+                        skippedMouseDown = true
+                    }
                     if let axWin = try aliveOrInvisible.getOrRegisterAxWindow(windowId: id, window, nsApp, job),
                        !existingTitleIds.contains(id)
                     {
                         newTitles[id] = axWin.ax.get(Ax.titleAttr) ?? ""
                     }
-                    aliveWindowIds.insert(id)
+                    if aliveOrInvisible[id] != nil {
+                        aliveWindowIds.insert(id)
+                    }
                 }
 
                 windows.threadGuarded = aliveOrInvisible
                 let statuses: [UInt32: WindowLifeStatus] = aliveOrInvisible.keys.associate(with: { it in
                     aliveWindowIds.contains(it) ? .alive : .invisible
                 })
-                return (statuses, newTitles)
+                return (statuses, newTitles, skippedMouseDown)
             }
         var aliveOrInvisible = rawAliveOrInvisible
         bgTabsScheduledForPrune = []
         let wasInitialRefreshCompleted = hasCompletedInitialWindowRefresh
         hasCompletedInitialWindowRefresh = true
-        needsWindowRefresh = false
+        needsWindowRefresh = skippedDueToMouseDown
+        if skippedDueToMouseDown {
+            Task.startUnstructured { @MainActor [weak self] in
+                for delayMs in [120, 350] {
+                    try? await Task.sleep(for: .milliseconds(delayMs))
+                    guard let self, self.needsWindowRefresh else { return }
+                    if !isLeftMouseButtonDown {
+                        scheduleCancellableCompleteRefreshSession(.globalObserverLeftMouseUp)
+                        return
+                    }
+                }
+            }
+        }
         windowsCount = aliveOrInvisible.count
         if wasInitialRefreshCompleted && !newTitles.isEmpty {
             onNewWindowCreated()
@@ -980,10 +1024,14 @@ final class MacApp: AbstractApp {
         let noLongerAlive = lifeStatusesOfLastRefresh.filter { (id, lifeStatus) in lifeStatus == .alive && aliveOrInvisible[id] != .alive }
         let becameAlive = aliveOrInvisible.filter { (id, lifeStatus) in lifeStatus == .alive && lifeStatusesOfLastRefresh[id] != .alive }
         lifeStatusesOfLastRefresh = aliveOrInvisible
+        guard !isUnitTest ? rawAppBundleId != "com.google.Chrome" : true else { return }
         if let backgroundTabId = noLongerAlive.singleOrNil()?.key,
            let frontmostTabId = becameAlive.singleOrNil()?.key
         {
             let tabGroupWindowId = getOrRegisterOpaqueWindowId(backgroundTabId)
+            if MacWindow.allWindowsMap[tabGroupWindowId]?.parent is MacosPopupWindowsContainer {
+                return
+            }
             windowIdMapping.put(tabGroupWindowId, frontmostTabId)
             aliveOrInvisible[backgroundTabId] = nil
             bgTabsScheduledForPrune.insert(backgroundTabId)
