@@ -28,7 +28,12 @@ final class MacApp: AbstractApp {
     @MainActor private var preventAutoHideUntil: ContinuousClock.Instant? = nil
     @MainActor static var lastAeroSpaceActiveAppHideTime: ContinuousClock.Instant? = nil
     @MainActor private var inFlightFocusJobsCount: Int = 0
+    @MainActor private var inFlightBackgroundMainJobsCount: Int = 0
     @MainActor private var lastNativeFocusTime: ContinuousClock.Instant? = nil
+    @MainActor private var lastBackgroundMainSyncTime: ContinuousClock.Instant? = nil
+    @MainActor private var lastPromotedStandardChromeWindowId: OpaqueWindowId? = nil
+    @MainActor private var lastBackgroundMainWindowId: OpaqueWindowId? = nil
+    @MainActor private var backgroundMainWindowJob: RunLoopJob? = nil
     @MainActor private(set) var isDetachingTabToNewWindow: Bool = false
     @MainActor private var cachedAliveWindowIds: [OpaqueWindowId: WindowLifeStatus] = [:]
     @MainActor private var hasCompletedInitialWindowRefresh: Bool = false
@@ -192,6 +197,13 @@ final class MacApp: AbstractApp {
         if serverArgs.isReadOnly { return }
         unhideIfHiddenByAeroSpace(forceIfHidden: true)
         MacApp.focusJob?.cancel()
+        if rawAppBundleId == "com.google.Chrome" {
+            backgroundMainWindowJob?.cancel()
+            lastBackgroundMainWindowId = windowId
+            if hasStandardChromeTitle(windowId) {
+                lastPromotedStandardChromeWindowId = windowId
+            }
+        }
         recordAeroSpaceNativeFocus(windowId, app: self)
         inFlightFocusJobsCount += 1
         lastNativeFocusTime = .now
@@ -216,6 +228,116 @@ final class MacApp: AbstractApp {
                 // Deprecated since #macos14
                 nsApp.activate(options: .activateIgnoringOtherApps)
             }
+        }
+        if rawAppBundleId != "com.google.Chrome" {
+            MacApp.syncAllChromeVisibleStandardMainWindows()
+        }
+    }
+
+    @MainActor
+    func hasStandardChromeTitle(_ windowId: OpaqueWindowId) -> Bool {
+        guard rawAppBundleId == "com.google.Chrome",
+              let nativeWindowId = windowIdMapping.forward[windowId]
+        else { return false }
+        return cachedTitles[nativeWindowId]?.contains("- Google Chrome") == true
+    }
+
+    @MainActor
+    func visibleWorkspaceStandardChromeWindowId() -> OpaqueWindowId? {
+        guard rawAppBundleId == "com.google.Chrome" else { return nil }
+        for win in globalFocus.workspace.allLeafWindowsRecursiveMru {
+            if let macWin = win as? MacWindow,
+               macWin.macApp.pid == self.pid,
+               hasStandardChromeTitle(macWin.windowId)
+            {
+                return macWin.windowId
+            }
+        }
+        return nil
+    }
+
+    @MainActor
+    func noteChromeWindowNativelyFocused(_ windowId: OpaqueWindowId) {
+        guard rawAppBundleId == "com.google.Chrome" else { return }
+        lastBackgroundMainWindowId = windowId
+        if hasStandardChromeTitle(windowId) {
+            lastPromotedStandardChromeWindowId = windowId
+        }
+    }
+
+    @MainActor
+    func raiseWindowWithoutActivating(_ windowId: OpaqueWindowId) {
+        if isUnitTest || serverArgs.isReadOnly { return }
+        inFlightBackgroundMainJobsCount += 1
+        lastBackgroundMainSyncTime = .now
+        let pid = self.pid
+        _ = withWindowAsync(windowId, .cancellable, onComplete: {
+            Task.startUnstructured { @MainActor in
+                if let app = MacApp.allAppsMap[pid] {
+                    app.inFlightBackgroundMainJobsCount = max(0, app.inFlightBackgroundMainJobsCount - 1)
+                    app.lastBackgroundMainSyncTime = .now
+                }
+            }
+        }) { window, _ in
+            window.set(Ax.isMainAttr, true)
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        }
+    }
+
+    @MainActor
+    static func syncAllChromeVisibleStandardMainWindows(force: Bool = false) {
+        if isUnitTest || serverArgs.isReadOnly { return }
+        for app in allAppsMap.values where app.rawAppBundleId == "com.google.Chrome" {
+            app.syncVisibleWorkspaceStandardChromeMainWindow(force: force)
+        }
+    }
+
+    @MainActor
+    func syncVisibleWorkspaceStandardChromeMainWindow(force: Bool = false) {
+        guard rawAppBundleId == "com.google.Chrome",
+              !isUnitTest,
+              !serverArgs.isReadOnly,
+              !isDetachingTabToNewWindow
+        else { return }
+        guard let stdWinId = visibleWorkspaceStandardChromeWindowId(),
+              let stdNativeId = windowIdMapping.forward[stdWinId]
+        else { return }
+
+        let focusedWin = globalFocus.windowOrNil as? MacWindow
+        if let focusedWin, focusedWin.macApp.pid == self.pid {
+            if hasStandardChromeTitle(focusedWin.windowId) {
+                lastPromotedStandardChromeWindowId = focusedWin.windowId
+                lastBackgroundMainWindowId = focusedWin.windowId
+            }
+            return
+        }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == self.pid {
+            return
+        }
+
+        guard force || lastBackgroundMainWindowId != stdWinId || lastPromotedStandardChromeWindowId != stdWinId,
+              let thread
+        else { return }
+        lastPromotedStandardChromeWindowId = stdWinId
+        lastBackgroundMainWindowId = stdWinId
+        lastFocusedNativeWindowOpaqueId = stdWinId
+        inFlightBackgroundMainJobsCount += 1
+        lastBackgroundMainSyncTime = .now
+        let pid = self.pid
+        backgroundMainWindowJob?.cancel()
+        backgroundMainWindowJob = thread.runInLoopAsync(job: RunLoopJob(.cancellable), autoCheckCancelled: false) { [windows] job in
+            defer {
+                _ = Thread.current.runInLoopAsync(job: RunLoopJob(.nonCancellable), autoCheckCancelled: false) { _ in
+                    Task.startUnstructured { @MainActor in
+                        if let app = MacApp.allAppsMap[pid] {
+                            app.inFlightBackgroundMainJobsCount = max(0, app.inFlightBackgroundMainJobsCount - 1)
+                            app.lastBackgroundMainSyncTime = .now
+                        }
+                    }
+                }
+            }
+            if job.isCancelled { return }
+            windows.threadGuarded[stdNativeId]?.ax.set(Ax.isMainAttr, true)
         }
     }
 
@@ -272,6 +394,8 @@ final class MacApp: AbstractApp {
             }
             let isOffWorkspace = win.nodeWorkspace == nil || win.nodeWorkspace?.isVisible == false
             if isOffWorkspace {
+                lastBackgroundMainWindowId = nil
+                lastPromotedStandardChromeWindowId = nil
                 lastOffWorkspaceFocusTime[nativeWindowId] = .now
                 lastFocusedOffWorkspaceChromeWindowId = nativeWindowId
                 if let currentTitle, !currentTitle.isEmpty {
@@ -285,6 +409,11 @@ final class MacApp: AbstractApp {
                     }
                 }
                 return
+            } else {
+                lastBackgroundMainWindowId = win.windowId
+                if hasStandardChromeTitle(win.windowId) {
+                    lastPromotedStandardChromeWindowId = win.windowId
+                }
             }
         }
         await checkForNewlyOpenedExternalChromeTab(hintWindowId: nativeWindowId)
@@ -319,6 +448,9 @@ final class MacApp: AbstractApp {
         guard isOffWorkspace else {
             preChangeTitles.removeValue(forKey: nativeWindowId)
             lastOffWorkspaceTitleChangeTime.removeValue(forKey: nativeWindowId)
+            if newTitle.contains("- Google Chrome") {
+                syncVisibleWorkspaceStandardChromeMainWindow()
+            }
             return false
         }
 
@@ -394,20 +526,33 @@ final class MacApp: AbstractApp {
         let hasRecentOffWorkspaceFocus = lastOffWorkspaceFocusTime[winId].map { $0.duration(to: .now) < .seconds(2.0) } ?? false
         guard hasRecentActivation || hasRecentOffWorkspaceFocus else { return }
 
-        // If the user is actively focused on a normal Chrome browser window on the visible workspace
-        // and Chrome itself did not focus the off-workspace window, any title change on winId is pure
-        // background activity (e.g. unread count / memory saver badge), never an external link open.
-        if !hasRecentOffWorkspaceFocus,
-           let focusedMacWin = globalFocus.windowOrNil as? MacWindow,
-           focusedMacWin.macApp.pid == self.pid,
-           focusedMacWin.nodeWorkspace?.isVisible == true,
-           let fid = nativeWindowId(of: focusedMacWin.windowId),
-           fid != winId,
-           cachedTitles[fid]?.contains("- Google Chrome") == true
-        {
-            preChangeTitles.removeValue(forKey: winId)
-            lastOffWorkspaceTitleChangeTime.removeValue(forKey: winId)
-            return
+        // If the visible workspace already has a normal Chrome browser window that has been promoted
+        // as Chrome's active browser window (or is currently focused), and Chrome itself did not focus
+        // the off-workspace window, any title change on winId is pure background activity (e.g. unread
+        // count / memory saver badge), never an external link open.
+        let visibleStdWinId = visibleWorkspaceStandardChromeWindowId()
+        let visibleStdNativeId = visibleStdWinId.flatMap { nativeWindowId(of: $0) }
+        if !hasRecentOffWorkspaceFocus {
+            if let focusedMacWin = globalFocus.windowOrNil as? MacWindow,
+               focusedMacWin.macApp.pid == self.pid,
+               focusedMacWin.nodeWorkspace?.isVisible == true,
+               let fid = nativeWindowId(of: focusedMacWin.windowId),
+               fid != winId,
+               cachedTitles[fid]?.contains("- Google Chrome") == true
+            {
+                preChangeTitles.removeValue(forKey: winId)
+                lastOffWorkspaceTitleChangeTime.removeValue(forKey: winId)
+                return
+            }
+            if let visibleStdWinId,
+               let visibleStdNativeId,
+               visibleStdNativeId != winId,
+               lastPromotedStandardChromeWindowId == visibleStdWinId
+            {
+                preChangeTitles.removeValue(forKey: winId)
+                lastOffWorkspaceTitleChangeTime.removeValue(forKey: winId)
+                return
+            }
         }
 
         let targetOpaqueId = opaqueWindowId(of: winId)
@@ -427,6 +572,13 @@ final class MacApp: AbstractApp {
             let appEl = axApp.threadGuarded
             if let currentWins = appEl.get(Ax.windowsAttr),
                currentWins.contains(where: { windows.threadGuarded[$0.windowId] == nil })
+            {
+                return false
+            }
+            if !hasRecentOffWorkspaceFocus,
+               let visibleStdNativeId,
+               visibleStdNativeId != winId,
+               appEl.get(Ax.focusedWindowAttr)?.windowId == visibleStdNativeId
             {
                 return false
             }
@@ -456,7 +608,7 @@ final class MacApp: AbstractApp {
         {
             fid
         } else {
-            nil
+            visibleStdNativeId != winId ? visibleStdNativeId : nil
         }
 
         inFlightFocusJobsCount += 1
@@ -481,8 +633,13 @@ final class MacApp: AbstractApp {
             }
             let snap = readChromeTabMenuSnapshot(appEl)
             let winTitle = axWin.get(Ax.titleAttr)
-            if !alreadyMain, let restoreMainWinId {
-                windows.threadGuarded[restoreMainWinId]?.ax.set(Ax.isMainAttr, true)
+            if !alreadyMain {
+                if let visibleStdNativeId, visibleStdNativeId != winId {
+                    windows.threadGuarded[visibleStdNativeId]?.ax.set(Ax.isMainAttr, true)
+                }
+                if let restoreMainWinId, restoreMainWinId != visibleStdNativeId {
+                    windows.threadGuarded[restoreMainWinId]?.ax.set(Ax.isMainAttr, true)
+                }
             }
             guard let snap,
                   let winTitle,
@@ -644,8 +801,14 @@ final class MacApp: AbstractApp {
 
     @MainActor
     var isSuppressingSelfFocusNotifications: Bool {
-        if inFlightFocusJobsCount > 0 { return true }
+        if inFlightFocusJobsCount > 0 || inFlightBackgroundMainJobsCount > 0 { return true }
         if let lastNativeFocusTime, lastNativeFocusTime.duration(to: .now) < .milliseconds(500) {
+            return true
+        }
+        if let lastBackgroundMainSyncTime,
+           lastBackgroundMainSyncTime.duration(to: .now) < .milliseconds(150),
+           MacApp.lastExternalChromeActivationTime.map({ $0 < lastBackgroundMainSyncTime }) ?? true
+        {
             return true
         }
         return false
@@ -690,6 +853,9 @@ final class MacApp: AbstractApp {
                             try? await macWin.hideInCorner(.bottomRightCorner)
                         }
                     }
+                }
+                if self.rawAppBundleId == "com.google.Chrome" {
+                    self.syncVisibleWorkspaceStandardChromeMainWindow()
                 }
             }
         }
@@ -881,6 +1047,9 @@ final class MacApp: AbstractApp {
             preChangeTitles[nativeWindowId] = old
         }
         cachedTitles[nativeWindowId] = title
+        if rawAppBundleId == "com.google.Chrome", title.contains("- Google Chrome") {
+            syncVisibleWorkspaceStandardChromeMainWindow()
+        }
     }
 
     @MainActor

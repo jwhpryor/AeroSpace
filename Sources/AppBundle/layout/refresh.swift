@@ -313,6 +313,7 @@ private func layoutWorkspaces(allowAutoHide: Bool = true, focusToSync: Window? =
     if !didSyncFocus {
         focusToSync?.nativeFocus()
     }
+    MacApp.syncAllChromeVisibleStandardMainWindows()
     for workspace in Workspace.all where !workspace.isVisible {
         let monitorOrigin = workspace.workspaceMonitorInfo.rect.topLeftCorner
         let corner = monitorToOptimalHideCorner[monitorOrigin] ?? .bottomRightCorner

@@ -46,6 +46,13 @@ import Common
     {
         _ = nativeFocused?.focusWindow()
         lastKnownNativeFocusedWindowId = nativeFocused?.windowId
+        if !isUnitTest,
+           let macWin = nativeFocused as? MacWindow,
+           macWin.macApp.rawAppBundleId == "com.google.Chrome"
+        {
+            macWin.macApp.noteChromeWindowNativelyFocused(macWin.windowId)
+        }
     }
     nativeFocused?.macAppUnsafe.lastFocusedNativeWindowOpaqueId = nativeFocused?.windowId
+    MacApp.syncAllChromeVisibleStandardMainWindows()
 }

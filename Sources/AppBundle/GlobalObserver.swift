@@ -28,6 +28,8 @@ enum GlobalObserver {
                                 await app.checkForNewlyOpenedExternalChromeTab()
                             }
                         }
+                    } else {
+                        MacApp.syncAllChromeVisibleStandardMainWindows()
                     }
                 } else if notifName == NSWorkspace.didActivateApplicationNotification.rawValue {
                     onAppActivatedInWorkspace(notifPid)
@@ -44,6 +46,8 @@ enum GlobalObserver {
                                 await app.checkForNewlyOpenedExternalChromeTab()
                             }
                         }
+                    } else {
+                        MacApp.syncAllChromeVisibleStandardMainWindows()
                     }
                 }
             }
