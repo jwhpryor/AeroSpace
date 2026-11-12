@@ -292,16 +292,17 @@ final class MacApp: AbstractApp {
 
     @MainActor
     fileprivate func onChromeWindowTitleChanged(_ nativeWindowId: UInt32, _ newTitle: String) -> Bool {
-        let oldTitle = cachedTitles[nativeWindowId]
+        let oldTitle = cachedTitles[nativeWindowId] ?? preChangeTitles[nativeWindowId]
         cachedTitles[nativeWindowId] = newTitle
         guard !isDetachingTabToNewWindow,
               let oldTitle,
               !oldTitle.isEmpty,
               !newTitle.isEmpty,
-              oldTitle != newTitle
+              oldTitle != newTitle || preChangeTitles[nativeWindowId] != nil
         else { return false }
 
-        let strippedOld = stripChromeTitleSuffix(oldTitle)
+        let effectiveOldTitle = (oldTitle != newTitle) ? oldTitle : (preChangeTitles[nativeWindowId] ?? oldTitle)
+        let strippedOld = stripChromeTitleSuffix(effectiveOldTitle)
         let strippedNew = stripChromeTitleSuffix(newTitle)
         guard strippedOld != strippedNew else { return false }
 
@@ -323,7 +324,7 @@ final class MacApp: AbstractApp {
 
         let hadRecentChange = lastOffWorkspaceTitleChangeTime[nativeWindowId].map { $0.duration(to: .now) < .seconds(3.0) } ?? false
         if !hadRecentChange || preChangeTitles[nativeWindowId] == nil {
-            preChangeTitles[nativeWindowId] = oldTitle
+            preChangeTitles[nativeWindowId] = effectiveOldTitle
         }
         lastOffWorkspaceTitleChangeTime[nativeWindowId] = .now
         lastTitleChangedChromeWindowId = nativeWindowId
@@ -389,10 +390,25 @@ final class MacApp: AbstractApp {
         }
         guard let winId = candidateWinId else { return }
 
-        let hasRecentActivation = MacApp.lastExternalChromeActivationTime.map { $0.duration(to: .now) < .seconds(3.0) } ?? false
-        let hasRecentMouseUp = MacApp.lastNonChromeLeftMouseUpTime.map { $0.duration(to: .now) < .seconds(3.0) } ?? false
-        let hasRecentOffWorkspaceFocus = lastOffWorkspaceFocusTime[winId].map { $0.duration(to: .now) < .seconds(3.0) } ?? false
-        guard hasRecentActivation || hasRecentMouseUp || hasRecentOffWorkspaceFocus else { return }
+        let hasRecentActivation = MacApp.lastExternalChromeActivationTime.map { $0.duration(to: .now) < .seconds(2.0) } ?? false
+        let hasRecentOffWorkspaceFocus = lastOffWorkspaceFocusTime[winId].map { $0.duration(to: .now) < .seconds(2.0) } ?? false
+        guard hasRecentActivation || hasRecentOffWorkspaceFocus else { return }
+
+        // If the user is actively focused on a normal Chrome browser window on the visible workspace
+        // and Chrome itself did not focus the off-workspace window, any title change on winId is pure
+        // background activity (e.g. unread count / memory saver badge), never an external link open.
+        if !hasRecentOffWorkspaceFocus,
+           let focusedMacWin = globalFocus.windowOrNil as? MacWindow,
+           focusedMacWin.macApp.pid == self.pid,
+           focusedMacWin.nodeWorkspace?.isVisible == true,
+           let fid = nativeWindowId(of: focusedMacWin.windowId),
+           fid != winId,
+           cachedTitles[fid]?.contains("- Google Chrome") == true
+        {
+            preChangeTitles.removeValue(forKey: winId)
+            lastOffWorkspaceTitleChangeTime.removeValue(forKey: winId)
+            return
+        }
 
         let targetOpaqueId = opaqueWindowId(of: winId)
         let targetWin = targetOpaqueId.flatMap { MacWindow.allWindowsMap[$0] }
@@ -443,6 +459,13 @@ final class MacApp: AbstractApp {
             nil
         }
 
+        inFlightFocusJobsCount += 1
+        lastNativeFocusTime = .now
+        defer {
+            inFlightFocusJobsCount = max(0, inFlightFocusJobsCount - 1)
+            lastNativeFocusTime = .now
+        }
+
         guard let (snap, currentWinTitle) = try? await thread.runInLoop(.cancellable, { [axApp, windows] _ -> (ChromeTabMenuSnapshot, String)? in
             let appEl = axApp.threadGuarded
             if let currentWins = appEl.get(Ax.windowsAttr),
@@ -451,10 +474,18 @@ final class MacApp: AbstractApp {
                 return nil
             }
             guard let axWin = windows.threadGuarded[winId]?.ax else { return nil }
-            axWin.set(Ax.isMainAttr, true)
-            Thread.sleep(forTimeInterval: 0.03)
-            guard let snap = readChromeTabMenuSnapshot(appEl),
-                  let winTitle = axWin.get(Ax.titleAttr),
+            let alreadyMain = appEl.get(Ax.focusedWindowAttr)?.windowId == winId
+            if !alreadyMain {
+                axWin.set(Ax.isMainAttr, true)
+                Thread.sleep(forTimeInterval: 0.025)
+            }
+            let snap = readChromeTabMenuSnapshot(appEl)
+            let winTitle = axWin.get(Ax.titleAttr)
+            if !alreadyMain, let restoreMainWinId {
+                windows.threadGuarded[restoreMainWinId]?.ax.set(Ax.isMainAttr, true)
+            }
+            guard let snap,
+                  let winTitle,
                   winTitle.contains("- Google Chrome")
             else { return nil }
             return (snap, winTitle)
@@ -468,10 +499,11 @@ final class MacApp: AbstractApp {
         }
         let checkedTabDiffersFromPreTitle = !chromeWindowTitle(preTitle, matchesTabMenuTitle: checkedTitle)
         let strippedCur = stripChromeTitleSuffix(currentWinTitle)
-        let checkedTabMatchesCurTitle =
-            chromeWindowTitle(currentWinTitle, matchesTabMenuTitle: checkedTitle) ||
+        let isTransientLoading =
             checkedTitle == "Untitled" || checkedTitle == "Loading…" || checkedTitle == "about:blank" ||
-            strippedCur == "Untitled" || strippedCur == "about:blank"
+            strippedCur == "Untitled" || strippedCur == "Loading…" || strippedCur == "about:blank"
+        let checkedTabMatchesCurTitle =
+            chromeWindowTitle(currentWinTitle, matchesTabMenuTitle: checkedTitle) || isTransientLoading
 
         let isMultiTabExternalOpen =
             snap.tabs.count >= 2 &&
@@ -485,9 +517,15 @@ final class MacApp: AbstractApp {
             checkedTabMatchesCurTitle
 
         guard isMultiTabExternalOpen || isSingleNewTabNavigated else {
-            if let restoreMainWinId {
-                _ = thread.runInLoopAsync(job: RunLoopJob(.cancellable), autoCheckCancelled: false) { [windows] _ in
-                    windows.threadGuarded[restoreMainWinId]?.ax.set(Ax.isMainAttr, true)
+            if !isTransientLoading {
+                preChangeTitles.removeValue(forKey: winId)
+                lastOffWorkspaceTitleChangeTime.removeValue(forKey: winId)
+                lastOffWorkspaceFocusTime.removeValue(forKey: winId)
+                if lastTitleChangedChromeWindowId == winId {
+                    lastTitleChangedChromeWindowId = nil
+                }
+                if lastFocusedOffWorkspaceChromeWindowId == winId {
+                    lastFocusedOffWorkspaceChromeWindowId = nil
                 }
             }
             return
@@ -597,6 +635,11 @@ final class MacApp: AbstractApp {
                 newWin.nativeFocus()
             }
         }
+    }
+
+    @MainActor
+    var hasInFlightFocusJobs: Bool {
+        inFlightFocusJobsCount > 0
     }
 
     @MainActor
@@ -828,15 +871,16 @@ final class MacApp: AbstractApp {
 
     @MainActor
     func updateCachedTitle(_ nativeWindowId: UInt32, _ title: String) {
-        if rawAppBundleId == "com.google.Chrome" {
-            if onChromeWindowTitleChanged(nativeWindowId, title) {
-                Task.startUnstructured { @MainActor [weak self] in
-                    await self?.checkForNewlyOpenedExternalChromeTab(hintWindowId: nativeWindowId)
-                }
-            }
-        } else {
-            cachedTitles[nativeWindowId] = title
+        if rawAppBundleId == "com.google.Chrome",
+           let old = cachedTitles[nativeWindowId],
+           !old.isEmpty,
+           old != title,
+           stripChromeTitleSuffix(old) != stripChromeTitleSuffix(title),
+           preChangeTitles[nativeWindowId] == nil
+        {
+            preChangeTitles[nativeWindowId] = old
         }
+        cachedTitles[nativeWindowId] = title
     }
 
     @MainActor

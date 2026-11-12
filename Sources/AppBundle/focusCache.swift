@@ -22,7 +22,7 @@ import Common
     }
     if !isUnitTest,
        let macApp = nativeFocused?.app as? MacApp,
-       macApp.isSuppressingSelfFocusNotifications,
+       macApp.hasInFlightFocusJobs,
        let lastId = lastKnownNativeFocusedWindowId,
        nativeFocused?.windowId != lastId,
        MacWindow.allWindowsMap[lastId] != nil
@@ -41,7 +41,9 @@ import Common
         }
         return
     }
-    if nativeFocused?.windowId != lastKnownNativeFocusedWindowId {
+    if nativeFocused?.windowId != lastKnownNativeFocusedWindowId ||
+       (!isUnitTest && nativeFocused != nil && globalFocus.windowOrNil?.windowId != nativeFocused?.windowId)
+    {
         _ = nativeFocused?.focusWindow()
         lastKnownNativeFocusedWindowId = nativeFocused?.windowId
     }
