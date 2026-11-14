@@ -245,15 +245,10 @@ final class MacApp: AbstractApp {
     @MainActor
     func visibleWorkspaceStandardChromeWindowId() -> OpaqueWindowId? {
         guard rawAppBundleId == "com.google.Chrome" else { return nil }
-        for win in globalFocus.workspace.allLeafWindowsRecursiveMru {
-            if let macWin = win as? MacWindow,
-               macWin.macApp.pid == self.pid,
-               hasStandardChromeTitle(macWin.windowId)
-            {
-                return macWin.windowId
-            }
-        }
-        return nil
+        guard let firstChromeWin = globalFocus.workspace.allLeafWindowsRecursiveMru.first(where: {
+            ($0 as? MacWindow)?.macApp.pid == self.pid
+        }) else { return nil }
+        return hasStandardChromeTitle(firstChromeWin.windowId) ? firstChromeWin.windowId : nil
     }
 
     @MainActor
