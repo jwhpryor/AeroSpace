@@ -519,7 +519,12 @@ final class MacApp: AbstractApp {
 
         let hasRecentActivation = MacApp.lastExternalChromeActivationTime.map { $0.duration(to: .now) < .seconds(2.0) } ?? false
         let hasRecentOffWorkspaceFocus = lastOffWorkspaceFocusTime[winId].map { $0.duration(to: .now) < .seconds(2.0) } ?? false
-        guard hasRecentActivation || hasRecentOffWorkspaceFocus else { return }
+        let isFocusedOnNonStandardChrome = (globalFocus.windowOrNil as? MacWindow).map {
+            $0.macApp.pid == self.pid && !hasStandardChromeTitle($0.windowId)
+        } ?? false
+        let hasRecentPwaClick = isFocusedOnNonStandardChrome &&
+            (MacApp.lastNonChromeLeftMouseUpTime.map { $0.duration(to: .now) < .seconds(2.5) } ?? false)
+        guard hasRecentActivation || hasRecentOffWorkspaceFocus || hasRecentPwaClick else { return }
 
         // If the visible workspace already has a normal Chrome browser window that has been promoted
         // as Chrome's active browser window (or is currently focused), and Chrome itself did not focus
