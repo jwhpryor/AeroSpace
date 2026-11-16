@@ -23,9 +23,12 @@ enum GlobalObserver {
                         MacApp.lastExternalChromeActivationTime = .now
                         await app.checkForNewlyOpenedExternalChromeTab()
                         Task.startUnstructured { @MainActor in
-                            for delayMs in [100, 250] {
+                            for delayMs in [100, 250, 550] {
                                 try? await Task.sleep(for: .milliseconds(delayMs))
                                 await app.checkForNewlyOpenedExternalChromeTab()
+                                if delayMs == 250 {
+                                    await app.checkForTabCountIncreaseInTopChromeWindows()
+                                }
                             }
                         }
                     } else {
@@ -41,9 +44,12 @@ enum GlobalObserver {
                         MacApp.lastExternalChromeActivationTime = .now
                         await app.checkForNewlyOpenedExternalChromeTab()
                         Task.startUnstructured { @MainActor in
-                            for delayMs in [100, 250] {
+                            for delayMs in [100, 250, 550] {
                                 try? await Task.sleep(for: .milliseconds(delayMs))
                                 await app.checkForNewlyOpenedExternalChromeTab()
+                                if delayMs == 250 {
+                                    await app.checkForTabCountIncreaseInTopChromeWindows()
+                                }
                             }
                         }
                     } else {
@@ -138,7 +144,7 @@ enum GlobalObserver {
             //  resetManipulatedWithMouseIfPossible might call its own refreshSession
             //  The end of the callback calls refreshSession
             Task.startUnstructured { @MainActor in
-                MacApp.lastNonChromeLeftMouseUpTime = .now
+                MacApp.onGlobalLeftMouseUp()
                 try await resetManipulatedWithMouseIfPossible()
                 let mouseLocation = mouseLocation
                 let clickedMonitor = mouseLocation.monitorApproximation
