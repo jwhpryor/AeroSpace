@@ -6,15 +6,16 @@ import PrivateApi
 func waitForAccessibilityPermission_nonCancellable() async {
     let options = [axTrustedCheckOptionPrompt: true]
     while true {
-        let status = TrayMenuModel.shared.axPermissionStatus == .waitingWithPrompt
-            ? AXIsProcessTrustedWithOptions(options as CFDictionary)
-            : AXIsProcessTrusted()
-        if status {
+        if AXIsProcessTrusted() {
             TrayMenuModel.shared.axPermissionStatus = .granted
             break
         }
         if TrayMenuModel.shared.axPermissionStatus == .waitingWithPrompt {
-            resetAccessibility() // Because macOS doesn't reset it for us when the app signature changes...
+            resetAccessibility() // Clear stale entry for old signature BEFORE prompting so macOS adds the new one
+            if AXIsProcessTrustedWithOptions(options as CFDictionary) {
+                TrayMenuModel.shared.axPermissionStatus = .granted
+                break
+            }
         }
         TrayMenuModel.shared.axPermissionStatus = .waiting
         try? await Task.sleep(for: .seconds(1))
@@ -22,7 +23,9 @@ func waitForAccessibilityPermission_nonCancellable() async {
 }
 
 private func resetAccessibility() {
-    _ = try? Process.run(URL(filePath: "/usr/bin/tccutil"), arguments: ["reset", "Accessibility", aeroSpaceAppId])
+    if let process = try? Process.run(URL(filePath: "/usr/bin/tccutil"), arguments: ["reset", "Accessibility", aeroSpaceAppId]) {
+        process.waitUntilExit()
+    }
 }
 
 protocol ReadableAttr: Sendable {

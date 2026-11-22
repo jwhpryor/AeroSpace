@@ -138,6 +138,16 @@ enum GlobalObserver {
             }
         }
 
+        ChromeOptionResizeTap.shared.start()
+
+        NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { event in
+            let modifierFlags = event.modifierFlags
+            Task.startUnstructured { @MainActor in
+                if !TrayMenuModel.shared.isEnabled { return }
+                MacApp.onGlobalLeftMouseDown(modifierFlags: modifierFlags)
+            }
+        }
+
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { _ in
             guard let token: RunSessionGuard = .isServerEnabled else { return }
             // todo reduce number of refreshSession in the callback

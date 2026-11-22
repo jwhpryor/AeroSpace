@@ -245,12 +245,23 @@ final class MacApp: AbstractApp {
     }
 
     @MainActor
-    func visibleWorkspaceStandardChromeWindowId() -> OpaqueWindowId? {
+    func visibleWorkspaceStandardChromeWindowId(requireMruChromeWindow: Bool = true) -> OpaqueWindowId? {
         guard rawAppBundleId == "com.google.Chrome" else { return nil }
-        guard let firstChromeWin = globalFocus.workspace.allLeafWindowsRecursiveMru.first(where: {
-            ($0 as? MacWindow)?.macApp.pid == self.pid
-        }) else { return nil }
-        return hasStandardChromeTitle(firstChromeWin.windowId) ? firstChromeWin.windowId : nil
+        if requireMruChromeWindow {
+            guard let firstChromeWin = globalFocus.workspace.allLeafWindowsRecursiveMru.first(where: {
+                ($0 as? MacWindow)?.macApp.pid == self.pid
+            }) else { return nil }
+            return hasStandardChromeTitle(firstChromeWin.windowId) ? firstChromeWin.windowId : nil
+        }
+        for win in globalFocus.workspace.allLeafWindowsRecursiveMru {
+            if let macWin = win as? MacWindow,
+               macWin.macApp.pid == self.pid,
+               hasStandardChromeTitle(macWin.windowId)
+            {
+                return macWin.windowId
+            }
+        }
+        return nil
     }
 
     @MainActor
@@ -278,6 +289,14 @@ final class MacApp: AbstractApp {
         }) { window, _ in
             window.set(Ax.isMainAttr, true)
             AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        }
+    }
+
+    @MainActor
+    static func onGlobalLeftMouseDown(modifierFlags: NSEvent.ModifierFlags) {
+        if isUnitTest || serverArgs.isReadOnly { return }
+        if modifierFlags.contains(.command) {
+            syncAllChromeVisibleStandardMainWindows(force: true, requireMruChromeWindow: false)
         }
     }
 
@@ -330,21 +349,21 @@ final class MacApp: AbstractApp {
     }
 
     @MainActor
-    static func syncAllChromeVisibleStandardMainWindows(force: Bool = false) {
+    static func syncAllChromeVisibleStandardMainWindows(force: Bool = false, requireMruChromeWindow: Bool = true) {
         if isUnitTest || serverArgs.isReadOnly { return }
         for app in allAppsMap.values where app.rawAppBundleId == "com.google.Chrome" {
-            app.syncVisibleWorkspaceStandardChromeMainWindow(force: force)
+            app.syncVisibleWorkspaceStandardChromeMainWindow(force: force, requireMruChromeWindow: requireMruChromeWindow)
         }
     }
 
     @MainActor
-    func syncVisibleWorkspaceStandardChromeMainWindow(force: Bool = false) {
+    func syncVisibleWorkspaceStandardChromeMainWindow(force: Bool = false, requireMruChromeWindow: Bool = true) {
         guard rawAppBundleId == "com.google.Chrome",
               !isUnitTest,
               !serverArgs.isReadOnly,
               !isDetachingTabToNewWindow
         else { return }
-        guard let stdWinId = visibleWorkspaceStandardChromeWindowId(),
+        guard let stdWinId = visibleWorkspaceStandardChromeWindowId(requireMruChromeWindow: requireMruChromeWindow),
               let stdNativeId = windowIdMapping.forward[stdWinId]
         else { return }
 
